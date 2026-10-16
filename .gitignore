@@ -1,0 +1,7 @@
+# 无头浏览器临时 profile
+.profile-*/
+
+# 测试输出
+dom-nav.txt
+dom-quiz.txt
+*.err

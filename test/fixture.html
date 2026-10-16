@@ -1,0 +1,186 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>学习通 studentstudy 页仿真（顶层外壳 + 左侧目录 + 任务点 iframe）</title>
+<style>
+  html, body { margin: 0; padding: 0; font: 14px/1.5 "Microsoft YaHei", sans-serif; background: #eef1f6; }
+
+  /* 目录树：容器在【右侧】，类名是旧的 CATALOG_SEL 能命中的 #chapterList。
+     用来验证「靠目录容器名硬排除」这条规则。 */
+  #chapterList { position: absolute; right: 0; top: 0; width: 200px; height: 600px;
+    background: #fff; border-left: 1px solid #ccd; padding: 8px; box-sizing: border-box; }
+  #chapterList a { display: block; padding: 6px 4px; color: #345; text-decoration: none; }
+
+  /* 左侧栏：容器类名【不在】任何目录白名单里，只能靠几何位置排除。
+     这就是线上真正出 bug 的那类元素。 */
+  #railDecoyWrap { position: absolute; left: 0; top: 0; width: 200px; height: 600px;
+    background: #fff; border-right: 1px solid #ccd; padding: 8px; box-sizing: border-box; }
+  #railDecoyWrap a { display: block; padding: 6px 4px; color: #345; text-decoration: none; }
+
+  /* 顶层文档里一个「合法但优先级应该更低」的下一节 */
+  #topRightNext { position: absolute; left: 800px; top: 120px; padding: 8px 22px;
+    background: #8aa; color: #fff; border-radius: 4px; text-decoration: none; }
+
+  /* 任务点标签栏：1 视频（当前，高亮） + 2 章节测验（未完成，脚本应该点这个） */
+  #jobList { position: absolute; left: 800px; top: 20px; width: 180px; }
+  #jobList .jobTab { display: block; margin-bottom: 6px; padding: 6px 12px; border-radius: 14px;
+    background: #e8eef7; color: #345; cursor: pointer; text-align: center; }
+  #jobList .jobTab.active { background: #4a90d9; color: #fff; }
+
+  #frame { position: absolute; left: 220px; top: 0; width: 560px; height: 400px; border: 0; }
+
+  #RESULT { position: absolute; left: 220px; bottom: 0; width: 560px; max-height: 200px;
+    overflow: auto; white-space: pre; font: 12px/1.5 Consolas, monospace;
+    background: #111; color: #ddd; padding: 6px; box-sizing: border-box; }
+</style>
+</head>
+<body>
+  <div id="chapterList">
+    <a href="javascript:;" id="decoyCatalog">下一节</a>
+  </div>
+  <div id="railDecoyWrap">
+    <a href="javascript:;" id="decoyRail">下一节</a>
+  </div>
+  <a href="javascript:;" id="topRightNext">下一节</a>
+  <div class="ans-job-list" id="jobList">
+    <span class="jobTab active" id="tabVideo">1 视频</span>
+    <span class="jobTab" id="tabQuiz">2 章节测验</span>
+  </div>
+  <iframe id="frame" src="module-video.html"></iframe>
+  <div id="RESULT">PENDING</div>
+
+  <script src="../学习通-DeepSeek自动答题器.user.js"></script>
+  <script>
+  // 「2 章节测验」标签：点一下应该把当前任务点切到答题区（这里用往 iframe 里塞题目块模拟）
+  document.getElementById('tabQuiz').addEventListener('click', function () {
+    try {
+      var d = document.getElementById('frame').contentDocument;
+      var q = d.createElement('div');
+      q.className = 'TiMu';
+      q.textContent = '1.（章节测验）《荷马史诗》的作者传统上被认为是（ ） A. 荷马 B. 但丁 C. 维吉尔 D. 索福克勒斯';
+      d.getElementById('quizArea').appendChild(q);
+    } catch (e) {}
+  });
+  </script>
+  <script>
+  (async function () {
+    const R = [];
+    const ok = (name, cond, extra) => R.push((cond ? 'PASS  ' : 'FAIL  ') + name + (extra ? '   :: ' + extra : ''));
+    const out = () => { document.getElementById('RESULT').textContent =
+      '===TEST-START===\n' + R.join('\n') + '\n===TEST-END==='; };
+
+    // 等 iframe 加载完 + 脚本注入完
+    await new Promise(r => setTimeout(r, 600));
+
+    const dbg = window.__XXT_DEBUG__;
+    if (!dbg) { R.push('FAIL  找不到 __XXT_DEBUG__，脚本没跑起来'); out(); return; }
+
+    try {
+      const docs = dbg.getAllDocs();
+      ok('能扫到顶层 + 任务点 iframe 两个文档', docs.length >= 2, 'docs=' + docs.length);
+      ok('识别为视频任务点页', dbg.isVideoPageDetect(docs) === true);
+      const split = dbg.splitDocs(docs);
+      ok('识别出任务点 iframe', split.modules.length === 1, 'modules=' + split.modules.length);
+
+      // ---- 场景 1a：视频页（用户遇到的场景） ----
+      const a = dbg.collectNextCandidates(docs, { video: true });
+      const idsA = a.cands.map(c => c.el.id || '(no-id)');
+      ok('视频页：第 1 候选来自任务点 iframe（不是顶层/目录）',
+        !!(a.cands[0] && a.cands[0].doc !== document), 'cands=' + idsA.join(','));
+      ok('视频页：候选里有视频下方的真按钮 realNext', idsA.indexOf('realNext') > -1);
+      ok('视频页：真按钮排在按钮条大容器 barBox 之前',
+        idsA.indexOf('realNext') > -1 &&
+        (idsA.indexOf('barBox') < 0 || idsA.indexOf('realNext') < idsA.indexOf('barBox')),
+        idsA.join(','));
+      ok('视频页：不含目录诱饵 decoyCatalog', idsA.indexOf('decoyCatalog') < 0);
+      ok('视频页：不含左栏诱饵 decoyRail', idsA.indexOf('decoyRail') < 0);
+
+      // ---- 场景 1b：非视频分支（顶层文档也参与搜索） ----
+      const b = dbg.collectNextCandidates(docs, { video: false });
+      const idsB = b.cands.map(c => c.el.id || '(no-id)');
+      ok('非视频分支：目录容器名诱饵被硬排除（decoyCatalog）',
+        idsB.indexOf('decoyCatalog') < 0, 'cands=' + idsB.join(','));
+      ok('非视频分支：左侧栏几何诱饵被排除（decoyRail）',
+        idsB.indexOf('decoyRail') < 0, 'cands=' + idsB.join(','));
+      ok('非视频分支：iframe 真按钮仍排在顶层候选 topRightNext 之前',
+        idsB.indexOf('realNext') > -1 && idsB.indexOf('topRightNext') > -1 &&
+        idsB.indexOf('realNext') < idsB.indexOf('topRightNext'), idsB.join(','));
+      ok('isInCatalog 能认出目录容器内的元素',
+        !!dbg.isInCatalog(document.getElementById('decoyCatalog')));
+      ok('isInLeftRail 能认出左侧栏元素',
+        dbg.isInLeftRail(document.getElementById('decoyRail'), document) === true);
+
+      // ---- 场景 2a：点不动的候选必须被拉黑（旧版会反复点同一个直到误判课程结束） ----
+      dbg.CONFIG.NEXT_BTN_PICKED = '#deadNext';   // 强制让“哑按钮”排第 1
+      dbg.CONFIG.TASK_SWITCH_TIMEOUT = 700;
+      dbg.resetBadNext();
+      dbg.setRunning(true);
+
+      const docs2 = dbg.getAllDocs();
+      const c2 = dbg.collectNextCandidates(docs2, { video: true });
+      const ordered = c2.cands.map(c => c.el.id || '(no-id)');
+      ok('手动拾取后 deadNext 排第 1', ordered[0] === 'deadNext', ordered.join(','));
+
+      const deadOnly = await dbg.clickNextWithRetry([c2.cands[0]], true);
+      ok('只给哑按钮时返回 false（不会误判成已推进）', deadOnly === false);
+
+      const c2b = dbg.collectNextCandidates(dbg.getAllDocs(), { video: true });
+      const ids2b = c2b.cands.map(c => c.el.id || '(no-id)');
+      ok('deadNext 已进黑名单，换任务点前不再出现', ids2b.indexOf('deadNext') < 0, 'cands=' + ids2b.join(','));
+
+      // ---- 场景 2b：自动换下一个候选并成功推进 ----
+      const advanced = await dbg.clickNextWithRetry(c2b.cands, true);
+      ok('自动换到 realNext 后成功推进', advanced === true);
+
+      const afterDocs = dbg.getAllDocs();
+      ok('realNext 的点击真的生效了（答题区出现题目块）',
+        afterDocs.some(d => { try { return !!d.querySelector('.TiMu'); } catch (e) { return false; } }));
+
+      dbg.CONFIG.NEXT_BTN_PICKED = '';
+      dbg.setRunning(false);
+
+      // ---- 场景 3：反向对照 ----
+      // 故意关掉“目录容器排除”和“左侧栏几何排除”，诱饵应当立刻冒出来。
+      // 这一步是为了证明前面那些 PASS 不是因为断言写空了（即测试真的能失败）。
+      const savedCatalog = dbg.CONFIG.CATALOG_SEL;
+      const savedRatio = dbg.CONFIG.CATALOG_LEFT_RATIO;
+      dbg.CONFIG.CATALOG_SEL = '__xxt_none__';
+      dbg.CONFIG.CATALOG_LEFT_RATIO = 0;
+      const n = dbg.collectNextCandidates(docs, { video: false });
+      const idsN = n.cands.map(c => c.el.id || '(no-id)');
+      ok('反向对照：关掉规则后 decoyCatalog 会进入候选（证明规则真的在起作用）',
+        idsN.indexOf('decoyCatalog') > -1, 'cands=' + idsN.join(','));
+      ok('反向对照：关掉规则后 decoyRail 会进入候选',
+        idsN.indexOf('decoyRail') > -1, 'cands=' + idsN.join(','));
+      dbg.CONFIG.CATALOG_SEL = savedCatalog;
+      dbg.CONFIG.CATALOG_LEFT_RATIO = savedRatio;
+
+      // ---- 场景 4：同小节的任务点标签（视频 → 章节测验） ----
+      // 这是这一轮的核心：视频页不能再直接点“下一节”跳小节，要先点开「2 章节测验」
+      const tabs = dbg.collectTaskTabs(docs);
+      const tabIds = tabs.map(t => t.el.id || '(no-id)');
+      ok('能识别出未完成的任务点标签 tabQuiz', tabIds.indexOf('tabQuiz') > -1, 'tabs=' + tabIds.join(','));
+      ok('当前正在看的任务点 tabVideo 不算待切换标签', tabIds.indexOf('tabVideo') < 0, 'tabs=' + tabIds.join(','));
+      ok('待切换标签里 tabQuiz 排第 1', tabs.length > 0 && tabs[0].el.id === 'tabQuiz', tabIds.join(','));
+
+      dbg.resetVisitedTabs();
+      dbg.resetBadNext();
+      dbg.setRunning(true);
+      const sigBefore = dbg.taskSignature(dbg.getAllDocs());
+      const switched = await dbg.clickNextWithRetry(tabs.slice(0, 1), false);
+      ok('点「2 章节测验」后任务点确实切换了', switched === true);
+      ok('任务点指纹发生变化（真的进了答题区）', dbg.taskSignature(dbg.getAllDocs()) !== sigBefore);
+      dbg.setRunning(false);
+    } catch (e) {
+      R.push('FAIL  测试抛异常：' + (e && e.message));
+    }
+
+    const failed = R.filter(x => x.indexOf('FAIL') === 0).length;
+    R.push('---- 合计 ' + R.filter(x => x.indexOf('PASS') === 0 || x.indexOf('FAIL') === 0).length +
+      ' 项，失败 ' + failed + ' 项 ----');
+    out();
+  })();
+  </script>
+</body>
+</html>

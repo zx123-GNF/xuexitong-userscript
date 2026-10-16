@@ -1,0 +1,169 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>学习通 多选题仿真</title>
+<style>
+  html, body { margin: 0; padding: 0; font: 14px/1.6 "Microsoft YaHei", sans-serif; }
+  .TiMu { padding: 10px; border-bottom: 1px dashed #ccc; }
+  .Zy_TItle { font-weight: 600; margin-bottom: 6px; }
+  ul.nr_ul { list-style: none; margin: 0; padding: 0; }
+  ul.nr_ul li { padding: 6px 10px; margin: 4px 0; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; }
+  ul.nr_ul li[aria-checked="true"] { background: #dff0ff; border-color: #4a90d9; }
+  a.before { display: inline-block; width: 18px; color: #4a90d9; font-weight: 700; text-decoration: none; }
+  #RESULT { position: fixed; left: 0; bottom: 0; right: 0; max-height: 260px; overflow: auto;
+    white-space: pre; font: 12px/1.5 Consolas, monospace; background: #111; color: #ddd; padding: 6px; }
+  body { padding-bottom: 280px; }
+</style>
+</head>
+<body>
+  <!-- 题1：标题里明确写了「多选题」，li 点击会自己切换 aria-checked（学习通常见形态） -->
+  <div class="TiMu" id="q1">
+    <div class="Zy_TItle">1.（多选题）下列说法正确的有（ ）</div>
+    <ul class="nr_ul" id="ul1">
+      <li id="q1A" aria-checked="false"><a class="before">A</a><span>甲是正确的</span></li>
+      <li id="q1B" aria-checked="false"><a class="before">B</a><span>乙是正确的</span></li>
+      <li id="q1C" aria-checked="false"><a class="before">C</a><span>丙是正确的</span></li>
+      <li id="q1D" aria-checked="false"><a class="before">D</a><span>丁是正确的</span></li>
+    </ul>
+  </div>
+
+  <!-- 题2：题干里【没有】任何“多选/多项”字样，而且 li 点击不会自己置位（组件很“犟”），
+       专门用来验证「多选时绝不能把同组已选项清掉」这条修复 -->
+  <div class="TiMu" id="q2">
+    <div class="Zy_TItle">2. 下列属于古希腊人本主义表现的有（ ）</div>
+    <ul class="nr_ul" id="ul2">
+      <li id="q2A" aria-checked="false"><a class="before">A</a><span>重视人的价值</span></li>
+      <li id="q2B" aria-checked="false"><a class="before">B</a><span>神人同形同性</span></li>
+      <li id="q2C" aria-checked="false"><a class="before">C</a><span>强调命运不可抗</span></li>
+      <li id="q2D" aria-checked="false"><a class="before">D</a><span>肯定现世生活</span></li>
+    </ul>
+  </div>
+
+  <!-- 题3：纯 JS 组件（没有原生 radio/checkbox），li 点击什么都不做，
+       选中态只能靠 aria/class，答案还要写进隐藏框。
+       专门验证：隐藏答案框必须【并集累加】，旧版直接覆盖会让多选只剩最后一个字母 -->
+  <div class="TiMu" id="q4">
+    <div class="Zy_TItle">4.（多选）下列关于古希腊人本主义的说法正确的有（ ）</div>
+    <ul class="nr_ul" id="ul4">
+      <li id="q4A" aria-checked="false" data-letter="A"><span class="num_option" data="A" name="answerQ4">A</span><span>重视人的价值</span></li>
+      <li id="q4B" aria-checked="false" data-letter="B"><span class="num_option" data="B" name="answerQ4">B</span><span>神人同形同性</span></li>
+      <li id="q4C" aria-checked="false" data-letter="C"><span class="num_option" data="C" name="answerQ4">C</span><span>肯定现世生活</span></li>
+    </ul>
+    <input type="hidden" id="answerQ4" name="answerQ4" value="">
+  </div>
+
+  <div id="RESULT">PENDING</div>
+
+  <script src="../学习通-DeepSeek自动答题器.user.js"></script>
+  <script>
+  // 题1：li 点击自行切换 aria-checked（正常组件）
+  document.querySelectorAll('#ul1 li').forEach(li => {
+    li.addEventListener('click', () => {
+      li.setAttribute('aria-checked', li.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
+    });
+  });
+  // 题2：故意不绑定任何点击行为，逼 clickOption 走“手动同步 aria”兜底分支
+  </script>
+  <script>
+  (async function () {
+    const R = [];
+    const ok = (name, cond, extra) => R.push((cond ? 'PASS  ' : 'FAIL  ') + name + (extra ? '   :: ' + extra : ''));
+    const out = () => { document.getElementById('RESULT').textContent =
+      '===TEST-START===\n' + R.join('\n') + '\n===TEST-END==='; };
+
+    await new Promise(r => setTimeout(r, 500));
+    const dbg = window.__XXT_DEBUG__;
+    if (!dbg) { R.push('FAIL  找不到 __XXT_DEBUG__'); out(); return; }
+
+    try {
+      // ---------- A. 答案解析：多选答案的各种写法都要能拆开 ----------
+      const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+      ok('extractLetters(["A","C"]) → A,C', eq(dbg.extractLetters(['A', 'C']), ['A', 'C']));
+      ok('extractLetters("AC")   → A,C', eq(dbg.extractLetters('AC'), ['A', 'C']));
+      ok('extractLetters("A、C") → A,C', eq(dbg.extractLetters('A、C'), ['A', 'C']));
+      ok('extractLetters("A,C")  → A,C', eq(dbg.extractLetters('A,C'), ['A', 'C']));
+      ok('extractLetters("ＡＣ") 全角 → A,C', eq(dbg.extractLetters('ＡＣ'), ['A', 'C']));
+      ok('extractLetters(["A. DNA复制"]) → 只取 A（不能拆成 A/D/N）',
+        eq(dbg.extractLetters(['A. DNA复制']), ['A']), JSON.stringify(dbg.extractLetters(['A. DNA复制'])));
+      ok('extractLetters("正确") → 空（交给判断题兜底）', eq(dbg.extractLetters('正确'), []));
+
+      // ---------- B. 题型识别：只写「（多选）」也要认出来 ----------
+      const qs = dbg.collectQuestions(dbg.getAllDocs());
+      ok('扫到 3 道题', qs.length === 3, 'qs=' + qs.length);
+      const q1 = qs.find(q => q.title.indexOf('下列说法正确') > -1);
+      const q2 = qs.find(q => q.title.indexOf('古希腊人本主义') > -1);
+      ok('题1 被识别为多选题（题干写了“多选题”）', !!(q1 && q1.isMulti && /多选/.test(q1.type)), q1 && (q1.type + '/isMulti=' + q1.isMulti));
+      ok('题1 有 4 个选项且字母为 A–D', !!(q1 && q1.options.length === 4 && q1.options.map(o => o.letter).join('') === 'ABCD'),
+        q1 && q1.options.map(o => o.letter).join(''));
+      ok('题2 题干没有多选字样 → 不强判为多选', !!(q2 && q2.isMulti === false), q2 && ('type=' + q2.type));
+
+      // ---------- C. 多选题点击：能不能真的选上多个 ----------
+      const o1 = q1.options;
+      await dbg.clickOption(o1[0], true);
+      await dbg.clickOption(o1[2], true);
+      ok('题1：点 A 后 A 选中', dbg.optionSelected(o1[0]) === true);
+      ok('题1：再点 C 后 A 仍然选中（多选不能互相顶掉）', dbg.optionSelected(o1[0]) === true);
+      ok('题1：C 也选中了 → 一次拿到 2 个答案', dbg.optionSelected(o1[2]) === true);
+
+      // ---------- D. 「犟」组件：走兜底分支时，多选同样不能被清 ----------
+      const o2 = q2.options;
+      await dbg.clickOption(o2[0], true);
+      ok('题2：A 走兜底分支后被置位', dbg.optionSelected(o2[0]) === true);
+      await dbg.clickOption(o2[1], true);
+      ok('题2：B 置位后 A 仍保留（多选禁止清除同组）', dbg.optionSelected(o2[0]) === true);
+      ok('题2：A、B 同时选中', dbg.optionSelected(o2[0]) === true && dbg.optionSelected(o2[1]) === true);
+      ok('题1/题2 的点击没有污染别的题的隐藏答案框（必须限定在本题块内查找）',
+        document.getElementById('answerQ4').value === '', 'value=' + JSON.stringify(document.getElementById('answerQ4').value));
+
+      // ---------- E. 隐藏答案框：多选必须并集累加，不能覆盖 ----------
+      const q4 = qs.find(q => q.title.indexOf('人本主义的说法') > -1);
+      ok('题4 被识别为多选题', !!(q4 && q4.isMulti), q4 && ('type=' + q4.type + ' isMulti=' + q4.isMulti));
+      ok('题4 是纯 JS 组件（没有原生 input）', !!(q4 && q4.options.length === 3 && !q4.options.some(o => o.input)));
+
+      await dbg.clickOption(q4.options[0], true);
+      ok('题4：A 走兜底分支后被置位', dbg.optionSelected(q4.options[0]) === true);
+      ok('题4：隐藏答案框为 "A"',
+        document.getElementById('answerQ4').value === 'A', 'value=' + JSON.stringify(document.getElementById('answerQ4').value));
+
+      await dbg.clickOption(q4.options[2], true);
+      ok('题4：隐藏答案框并集累加为 "AC"（旧版会被覆盖成 "C"）',
+        document.getElementById('answerQ4').value === 'AC', 'value=' + JSON.stringify(document.getElementById('answerQ4').value));
+      ok('题4：A 与 C 同时选中', dbg.optionSelected(q4.options[0]) === true && dbg.optionSelected(q4.options[2]) === true);
+
+      // ---------- F. 多选"没选全就继续补选"的闭环 ----------
+      q4.options[2].li.setAttribute('aria-checked', 'false');
+      q4.options[2].li.setAttribute('aria-pressed', 'false');
+      q4.options[2].li.classList.remove('chosen');
+      dbg.multiPlan.set(dbg.qKeyOf(q4), { letters: ['A', 'C'], tries: 0 });
+      const pend = dbg.pendingMulti(q4);
+      ok('题4：能检测出多选没选全（缺 C）', !!(pend && pend.missing.join('') === 'C'), pend && pend.missing.join(','));
+
+      dbg.setRunning(true);
+      const acted = await dbg.retryPendingMulti([q4]);
+      ok('题4：补选流程被触发', acted === true);
+      ok('题4：补选后 C 已选中、不再 pending',
+        dbg.optionSelected(q4.options[2]) === true && dbg.pendingMulti(q4) === null);
+      dbg.setRunning(false);
+
+      // ---------- G. 选中态藏在子节点 class 上也要认出来 ----------
+      const q1a = q1.options[0];
+      q1a.li.setAttribute('aria-checked', 'false');
+      if (q1a.input) q1a.input.checked = false;
+      q1a.li.classList.remove('chosen');
+      const dot = q1a.li.querySelector('a.before');
+      dot.className = 'before chosen';
+      ok('选中态只体现在子节点 .before.chosen 上时，也能判定为已选', dbg.optionSelected(q1a) === true);
+      dot.className = 'before';
+    } catch (e) {
+      R.push('FAIL  测试抛异常：' + (e && e.message));
+    }
+
+    const failed = R.filter(x => x.indexOf('FAIL') === 0).length;
+    R.push('---- 合计 ' + R.filter(x => x.indexOf('PASS') === 0 || x.indexOf('FAIL') === 0).length +
+      ' 项，失败 ' + failed + ' 项 ----');
+    out();
+  })();
+  </script>
+</body>
+</html>
