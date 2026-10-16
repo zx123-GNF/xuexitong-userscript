@@ -1,9 +1,10 @@
 @echo off
 setlocal
 rem ============================================================
-rem  本地回归测试（无头 Chrome + 仿真学习通页面）
-rem  用法：先在另一个窗口执行   node test\server.js
-rem        再双击本文件
+rem  Local regression test for the userscript (headless Chrome)
+rem  1) open another window and run:  node test\server.js
+rem  2) then run this file
+rem  Output: dom-nav.txt / dom-quiz.txt  (see ===TEST-START===)
 rem ============================================================
 set WS=%~dp0
 set WS=%WS:~0,-1%
