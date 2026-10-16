@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      2.1.0
-// @description  学习通(超星)章节/作业/测验页面：填入自己的 DeepSeek API Key，点击启动后自动识别题目并调用 DeepSeek 作答（字体加密题自动截图走 deepseek-flash 视觉识别），自动提交、自动下一节。
+// @version      3.0.0
+// @description  学习通(超星)章节/作业/测验页面：填入自己的 DeepSeek API Key，点击启动后自动识别题目并调用 DeepSeek 作答（字体加密题自动截图走视觉识别），自动提交、自动下一节。v3.0.0 修复“找下一节时点到左侧目录树”的 bug：目录/左侧栏硬排除 + 视频页优先点播放器下方的按钮 + 候选逐个点击校验 + 手动拾取校准。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -54,7 +54,6 @@
     AUTO_SUBMIT: true,              // 答完是否自动点击“提交/交卷”并确认弹窗
     ENABLE_SUBJECTIVE: false,       // 是否自动作答简答题/论述题（textare a，默认关闭）
     STEP_DELAY: 1200,               // 每轮操作之间的等待(ms)
-    PAGE_TIMEOUT: 15000,            // 点击下一节后等待新内容的超时(ms)
     MAX_SECTIONS: 500,              // 安全阀：最多处理多少节
     SCROLL_STEPS: 3,                // 页面加载时向下滚动的次数（触发懒加载）
     // 学习通题目容器选择器（按优先级）
@@ -81,8 +80,24 @@
       '.sidebar', '.side-bar', '.left-menu', '.leftmenu', '.right-menu', '.rightmenu', '.menu',
       '#magazine', '.magazine', '.chapterNum', '.chapter-text', '.chapterText', '.chapter_name',
       '.prev_next_menu', '.crumb', '.breadcrumb', '#courseChapter', '.chapterContent',
-      '.section-list', '.sectionList', '.knowledge-list', '.tree', '[class*="catalog"]'
+      '.section-list', '.sectionList', '.knowledge-list', '.tree', '[class*="catalog"]',
+      // ↓↓↓ v3.0.0 补：学习通真实的目录/章节树容器（旧列表漏了大半，这是误点目录的根因之一）
+      '.posCatalog_tit', '.posCatalog_box', '.posCatalog_list', '.posCatalog_item',
+      '.catalog_body', '.catalogBody', '.chapter_body', '.chapterBox',
+      '.zjlist', '.zj_list', '.s-point-item', '.knowledge-item', '.knowledgeItem',
+      '.treebox', '#treebox', '.ztree', 'ul.ztree', '.joblist', '.jobList', '.ans-job-list',
+      '.chapterlist', '.chapter-tree', '.chapterTree', '.dirbox', '.sideCatalog',
+      '[id*="catalog"]', '[id*="Catalog"]', '[class*="chapterList"]', '[class*="chapter_list"]',
+      '[class*="coursetree"]', '[class*="courseTree"]'
     ].join(','),
+    // 任务点 iframe 特征：命中说明顶层文档只是外壳，目录树和顶部导航都在顶层
+    MODULE_IFRAME_RE: /ananas\/modules|\/work\/|doHomeWorkNew|knowledge\/cards|object\/log|video\/index|\/video\/|\/pdf\/|\/audio\/|exam-ans|examtopic/i,
+    // 顶层文档中，横向落在左侧这个比例宽度内的元素视为侧栏/目录，一律不点
+    CATALOG_LEFT_RATIO: 0.35,
+    // 手动拾取校准的“下一节”选择器（面板 🎯 拾取写入，优先级最高）
+    NEXT_BTN_PICKED: '',
+    // 点击下一节后，任务点内容多久没变化就算“点错了/没跳转”(ms)
+    TASK_SWITCH_TIMEOUT: 6000,
     // 找不到下一节按钮时的滚动重试次数（每次约 1.2s），超过则判定课程结束
     NO_NEXT_RETRIES: 5,
     // 提交按钮文本
@@ -104,6 +119,7 @@
       if (s.model) CONFIG.MODEL = s.model;
       if (typeof s.autoSubmit === 'boolean') CONFIG.AUTO_SUBMIT = s.autoSubmit;
       if (typeof s.subjective === 'boolean') CONFIG.ENABLE_SUBJECTIVE = s.subjective;
+      if (typeof s.nextPick === 'string') CONFIG.NEXT_BTN_PICKED = s.nextPick;
     } catch (e) {}
   }
   function saveSettings(patch) {
@@ -179,8 +195,14 @@
           <label><input type="checkbox" id="glm-subj" ${CONFIG.ENABLE_SUBJECTIVE ? 'checked' : ''}> 简答题</label>
         </div>
         <div class="row">
-          <button id="glm-diag" style="background:#3f6fb5;flex:1">🔍 诊断本题（结果发助手）</button>
+          <button id="glm-diag" style="background:#3f6fb5;flex:1">🔍 诊断本题</button>
+          <button id="glm-scan" style="background:#2f7f6f;flex:1">🧭 扫描自检</button>
         </div>
+        <div class="row">
+          <button id="glm-pick" style="background:#8a5cc4;flex:1">🎯 拾取「下一节」按钮</button>
+          <button id="glm-pickclear" style="background:#555f70;flex:0 0 56px">清除</button>
+        </div>
+        <div class="row"><div id="glm-pickinfo" style="font-size:11px;opacity:.75;line-height:1.45">下一节按钮：自动识别</div></div>
         <div class="log" id="glm-log"></div>
       </div>`;
     document.body.appendChild(panel);
@@ -223,6 +245,17 @@
       saveSettings({ subjective: e.target.checked });
     };
     panel.querySelector('#glm-diag').onclick = () => diagnose();
+    panel.querySelector('#glm-scan').onclick = () => scanReport();
+    panel.querySelector('#glm-pick').onclick = () => togglePicker();
+    panel.querySelector('#glm-pickclear').onclick = () => {
+      CONFIG.NEXT_BTN_PICKED = '';
+      saveSettings({ nextPick: '' });
+      refreshPickInfo();
+      log('已清除手动拾取的下一节按钮，改回自动识别', 'warn');
+    };
+    ui.pickInfo = panel.querySelector('#glm-pickinfo');
+    ui.pickBtn = panel.querySelector('#glm-pick');
+    refreshPickInfo();
     panel.querySelector('#glm-min').onclick = () => panel.classList.toggle('collapsed');
     makeDraggable(panel, panel.querySelector('.hd'));
   }
@@ -234,6 +267,13 @@
     } else {
       ui.keyInput.placeholder = 'DeepSeek API Key（sk-...）';
     }
+  }
+
+  function refreshPickInfo() {
+    if (!ui.pickInfo) return;
+    ui.pickInfo.textContent = CONFIG.NEXT_BTN_PICKED
+      ? '下一节按钮：已手动绑定 ' + CONFIG.NEXT_BTN_PICKED
+      : '下一节按钮：自动识别（万一又点错，用 🎯 拾取点一下真按钮）';
   }
 
   function makeDraggable(el, handle) {
@@ -1021,6 +1061,118 @@
     } catch (e) { return false; }
   }
 
+  /* =============== v3.0.0 新增：下一节解析基础设施 =============== */
+  const CLICKABLE_SEL = 'a,button,[role=button],input[type=button],input[type=submit],div,span,li,.btn';
+  let badNextEls = new WeakSet();      // 点过但页面没反应的“下一节”，本任务点内不再尝试
+  function resetBadNext() { badNextEls = new WeakSet(); }
+
+  // 元素/文档的可读描述（只为日志服务，方便你肉眼核对脚本要点哪一个）
+  function elDesc(el) {
+    if (!el) return '?';
+    const cls = (typeof el.className === 'string' ? el.className : '')
+      .trim().split(/\s+/).filter(Boolean).slice(0, 3).join('.');
+    return `<${(el.tagName || '?').toLowerCase()}${el.id ? '#' + el.id : ''}${cls ? '.' + cls : ''}>`;
+  }
+  function docDesc(doc) {
+    try {
+      const isTop = doc === window.top.document;
+      const u = (doc.location && doc.location.href) || '';
+      return (isTop ? '【顶层】' : '【iframe】') + u.replace(/^https?:\/\/[^/]+/, '').slice(0, 64);
+    } catch (e) { return '【?】'; }
+  }
+
+  // 顶层文档 / 任务点 iframe 分类
+  function splitDocs(docs) {
+    const topDoc = window.top.document;
+    const tops = [], frames = [];
+    docs.forEach(d => (d === topDoc ? tops : frames).push(d));
+    const modules = frames.filter(d => {
+      try {
+        const u = (d.location && d.location.href) || '';
+        if (CONFIG.MODULE_IFRAME_RE.test(u)) return true;
+        return !!d.querySelector('video,.vjs-tech,.vjs-player,.TiMu,.questionLi,.mark_question,.Zy_TItle');
+      } catch (e) { return false; }
+    });
+    return { tops, frames, modules };
+  }
+
+  // 顶层页面左侧区域（学习通的课程目录树就长在这里）
+  function isInLeftRail(el, doc) {
+    if (doc !== window.top.document) return false;
+    try {
+      const r = el.getBoundingClientRect();
+      const w = doc.documentElement.clientWidth || window.innerWidth || 0;
+      if (!w || !r.width) return false;
+      return (r.left + r.width) <= w * CONFIG.CATALOG_LEFT_RATIO;
+    } catch (e) { return false; }
+  }
+
+  // “下一节”文本匹配度：0 最精确
+  function nextTextRank(t) {
+    if (!t) return 99;
+    if (/^下一[节集讲]$/.test(t)) return 0;
+    if (/^下一(课时|页|个)$/.test(t)) return 1;
+    if (CONFIG.NEXT_BTN_TEXT.some(x => t === x)) return 1;
+    if (t.length <= 8 && CONFIG.NEXT_BTN_TEXT.some(x => t.includes(x))) return 2;
+    return 99;
+  }
+
+  // 返回“排除原因”；null 表示这个元素可以当候选
+  function rejectReason(el, doc, opts) {
+    opts = opts || {};
+    if (!el || el.nodeType !== 1) return '不是元素';
+    if (!isVisible(el)) return '不可见';
+    if (isDisabled(el)) return '已禁用';
+    if (el === document.body || el === document.documentElement) return '根节点';
+    if (isInCatalog(el)) return '在目录/侧栏容器内';
+    if (isInLeftRail(el, doc)) return '在顶层页面左侧栏区域';
+    if (badNextEls.has(el)) return '上次点击无效，已拉黑';
+    const t = cleanText(el.textContent || el.value || '');
+    if (!t) return opts.allowEmpty ? null : '无文本';
+    if (t.length > 10) return '文本过长';
+    if (CONFIG.EXCLUDE_TEXT.some(x => t.includes(x))) return '命中排除词：' + t;
+    if (nextTextRank(t) === 99) return '文本不是下一节：' + t;
+    return null;
+  }
+
+  // 任务点内容指纹：只关心“任务点有没有换”，比整页指纹更贴合本场景
+  function taskSignature(docs) {
+    const out = [];
+    docs.forEach(doc => {
+      try {
+        const isTop = doc === window.top.document;
+        const q = doc.querySelectorAll(CONFIG.QUESTION_BLOCK_SEL).length;
+        const v = doc.querySelectorAll('video,.vjs-tech,.vjs-player').length;
+        const href = isTop ? '' : ((doc.location && doc.location.href) || '');
+        const head = doc.querySelector(CONFIG.QUESTION_BLOCK_SEL);
+        out.push([isTop ? 'T' : 'F', q, v, href.slice(0, 100),
+          head ? cleanText(head.textContent).slice(0, 40) : ''].join('|'));
+      } catch (e) { out.push('?'); }
+    });
+    return out.join(' || ');
+  }
+
+  // 点击前把目标框出来（支持 iframe 内），让你肉眼确认它要点哪个
+  let hlBox = null;
+  function clearHighlight() {
+    try { if (hlBox && hlBox.parentNode) hlBox.parentNode.removeChild(hlBox); } catch (e) {}
+    hlBox = null;
+  }
+  function highlight(el) {
+    clearHighlight();
+    try {
+      const r = el.getBoundingClientRect();
+      const d = el.ownerDocument;
+      const box = d.createElement('div');
+      box.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483646;box-sizing:border-box;'
+        + 'left:' + Math.max(0, r.left - 4) + 'px;top:' + Math.max(0, r.top - 4) + 'px;'
+        + 'width:' + (r.width + 8) + 'px;height:' + (r.height + 8) + 'px;'
+        + 'border:3px solid #ff2d55;border-radius:5px;box-shadow:0 0 12px rgba(255,45,85,.85)';
+      d.body.appendChild(box);
+      hlBox = box;
+    } catch (e) {}
+  }
+
   const POPUP_SEL = '.layui-layer,.dialog,.modal,[class*="popup"],[class*="dialog"],[class*="Popup"],[role="dialog"],.el-message-box,.ant-modal,.weui-desktop-dialog,.mui-popup';
 
   // 扫描所有 frame 的确认弹窗并点击确认。
@@ -1114,97 +1266,173 @@
     log('提交流程已完成', 'ok');
   }
 
-  function findNext(docs) {
-    const CLICKABLE = 'a,button,[role=button],input[type=button],input[type=submit],div,span,li,.btn';
-    const matchesNextText = (t) => CONFIG.NEXT_BTN_TEXT.some(x => t === x || (t.length <= 8 && t.includes(x)));
-    const exactNextText = (t) => CONFIG.NEXT_BTN_TEXT.some(x => t === x);
+  /* ------------- 下一节候选解析（v3.0.0 修复核心） -------------
+   * 旧版把顶层窗口和所有 iframe 混成一个候选池，只排序后返回单个元素；
+   * 学习通左侧目录树里的“下一节”因此可能压过视频下方那个真按钮，
+   * 而且点错之后没有任何校验 —— 这就是“在目录里面找”的 bug。
+   * 现在：目录/左侧栏硬排除 → 视频页只认含播放器的文档 → 顶层候选重罚兜底
+   *      → 返回排序后的候选列表，由主循环逐个点击并校验任务点是否真的切换。
+   */
+  function collectNextCandidates(docs, opts) {
+    opts = opts || {};
+    const isVideo = !!opts.video;
+    const { modules } = splitDocs(docs);
+    let scope = docs;
+    let scopeWhy = '全文档搜索';
+
+    if (isVideo) {
+      const vd = docs.filter(d => {
+        try { return !!d.querySelector('video,.vjs-tech,.vjs-player'); } catch (e) { return false; }
+      });
+      if (vd.length) {
+        scope = vd;
+        scopeWhy = '视频页：只搜含播放器的文档（视频下面那个“下一节”就在这）';
+      } else if (modules.length) {
+        scope = modules;
+        scopeWhy = '视频页（没抓到播放器元素）：退回任务点 iframe';
+      }
+    }
+
     const cands = [];
+    const railFallback = [];   // 只在“一个候选都没有”时才放回来的左侧栏兜底
+    const seen = new Set();
 
-    // 优先级 1：明确 ID/类名的下一节按钮（最可靠）
-    for (const doc of docs) {
-      let els;
-      try { els = Array.from(doc.querySelectorAll(CONFIG.NEXT_BTN_SEL)); } catch (e) { continue; }
-      for (const el of els) {
-        if (!isVisible(el) || isDisabled(el) || isInCatalog(el)) continue;
-        const t = cleanText(el.textContent || el.value || '');
-        if (CONFIG.EXCLUDE_TEXT.some(x => t.includes(x))) continue;
-        if (t && !matchesNextText(t)) continue;
-        cands.push({ el, doc, t: t || '下一节', rank: 1 });
-      }
-    }
-    // 优先级 2：内容区按钮条容器内按文本找
-    for (const doc of docs) {
-      let bars;
-      try { bars = Array.from(doc.querySelectorAll(CONFIG.NEXT_BAR_SEL)); } catch (e) { continue; }
-      for (const bar of bars) {
-        if (isInCatalog(bar)) continue;
-        const els = Array.from(bar.querySelectorAll(CLICKABLE));
-        for (const el of els) {
-          if (!isVisible(el) || isDisabled(el)) continue;
-          const t = cleanText(el.textContent || el.value || '');
-          if (!t || t.length > 10) continue;
-          if (matchesNextText(t) && !CONFIG.EXCLUDE_TEXT.some(x => t.includes(x))) {
-            cands.push({ el, doc, t, rank: 2 });
+    const add = (el, doc, why) => {
+      if (!el || seen.has(el)) return null;
+      seen.add(el);
+      const t = cleanText(el.textContent || el.value || '') || '下一节';
+      const isTop = doc === window.top.document;
+      // 顶层文档的候选一律重罚：目录树/顶部章节导航都在顶层，只作最后的兜底
+      let prio = 30 + nextTextRank(t) * 5 + (isTop ? 40 : 0);
+      if (isVideo) {
+        try {
+          const v = doc.querySelector('video,.vjs-tech,.vjs-player');
+          if (v) {
+            const vr = v.getBoundingClientRect(), er = el.getBoundingClientRect();
+            if (er.top >= vr.bottom - 8) prio -= 20;        // 正好在播放器下方
           }
-        }
+          if (el.closest(CONFIG.NEXT_BAR_SEL)) prio -= 5;   // 在底部按钮条容器里
+        } catch (e) {}
       }
-    }
-    // 优先级 3：全文精确文本匹配，排除目录树，只认可点击元素
-    if (!cands.length) {
-      for (const doc of docs) {
-        let els;
-        try { els = Array.from(doc.querySelectorAll(CLICKABLE)); } catch (e) { continue; }
-        for (const el of els) {
-          if (!isVisible(el) || isDisabled(el) || isInCatalog(el)) continue;
-          const t = cleanText(el.textContent || el.value || '');
-          if (!t || t.length > 8) continue;
-          if (!exactNextText(t)) continue;
-          if (CONFIG.EXCLUDE_TEXT.some(x => t.includes(x))) continue;
-          const cls = typeof el.className === 'string' ? el.className : '';
-          const clickable = /^(A|BUTTON|INPUT)$/.test(el.tagName)
-            || el.getAttribute('role') === 'button' || el.hasAttribute('onclick')
-            || /btn|button/i.test(cls);
-          if (!clickable) continue;
-          cands.push({ el, doc, t, rank: 3 });
-        }
-      }
-    }
-    if (!cands.length) return null;
-    // 排序：rank 优先 → 任务点 iframe 优先 → 文本最短的叶子元素
-    const docScore = (d) => {
-      try {
-        const u = d.location.href || '';
-        if (/knowledge\/cards|doHomeWorkNew|\/work\/|\/video\/|object\/log/.test(u)) return 0;
-        if (/about:blank/.test(u)) return 2;
-        return 1;
-      } catch (e) { return 1; }
+      // 叶子节点更像真按钮；包着一堆子元素的大容器（比如整个按钮条）降权
+      try { if (!el.children || el.children.length === 0) prio -= 6; } catch (e) {}
+      const c = { el, doc, t, why, prio };
+      cands.push(c);
+      return c;
     };
-    cands.sort((a, b) => (a.rank - b.rank)
-      || (docScore(a.doc) - docScore(b.doc))
-      || ((a.el.textContent || '').length - (b.el.textContent || '').length));
-    return cands[0];
-  }
 
-  function fingerprint(docs) {
-    let fp = [];
-    docs.forEach(doc => {
-      try {
-        fp.push(doc.location.href);
-        fp.push(doc.title || '');
-        const blocks = doc.querySelectorAll(CONFIG.QUESTION_BLOCK_SEL);
-        fp.push('q=' + blocks.length);
-        if (blocks[0]) fp.push(cleanText(blocks[0].textContent).slice(0, 60));
-      } catch (e) {}
+    // 0) 手动拾取的选择器：优先级最高
+    if (CONFIG.NEXT_BTN_PICKED) {
+      docs.forEach(doc => {
+        let el = null;
+        try { el = doc.querySelector(CONFIG.NEXT_BTN_PICKED); } catch (e) {}
+        if (el && !rejectReason(el, doc, { allowEmpty: true })) {
+          const c = add(el, doc, '手动拾取');
+          if (c) c.prio = -100;
+        }
+      });
+    }
+
+    // 1) ID/类名明确的下一节按钮（最可靠）
+    scope.forEach(doc => {
+      let els = [];
+      try { els = Array.from(doc.querySelectorAll(CONFIG.NEXT_BTN_SEL)); } catch (e) {}
+      els.forEach(el => {
+        const r = rejectReason(el, doc, { allowEmpty: true });
+        if (r) {
+          if (r.indexOf('左侧栏') >= 0) railFallback.push([el, doc, '命中 NEXT_BTN_SEL']);
+          return;
+        }
+        add(el, doc, '命中 NEXT_BTN_SEL');
+      });
     });
-    return fp.join('|');
+
+    // 2) 底部按钮条容器内按文本找
+    scope.forEach(doc => {
+      let bars = [];
+      try { bars = Array.from(doc.querySelectorAll(CONFIG.NEXT_BAR_SEL)); } catch (e) {}
+      bars.forEach(bar => {
+        if (isInCatalog(bar) || isInLeftRail(bar, doc)) return;
+        let els = [];
+        try { els = Array.from(bar.querySelectorAll(CLICKABLE_SEL)); } catch (e) {}
+        els.forEach(el => {
+          if (rejectReason(el, doc)) return;
+          add(el, doc, '按钮条容器内');
+        });
+      });
+    });
+
+    // 3) 全文文本匹配（兜底），只认可点击元素
+    scope.forEach(doc => {
+      let els = [];
+      try { els = Array.from(doc.querySelectorAll(CLICKABLE_SEL)); } catch (e) {}
+      els.forEach(el => {
+        if (rejectReason(el, doc)) return;
+        const t = cleanText(el.textContent || el.value || '');
+        const cls = typeof el.className === 'string' ? el.className : '';
+        const clickable = /^(A|BUTTON|INPUT)$/.test(el.tagName)
+          || el.getAttribute('role') === 'button' || el.hasAttribute('onclick')
+          || /btn|button|next/i.test(cls);
+        if (!clickable) return;
+        add(el, doc, '全文文本匹配');
+      });
+    });
+
+    // 全部落空时才启用左侧栏兜底（避免“明明有按钮却被判成本课程结束”）
+    if (!cands.length && railFallback.length) {
+      railFallback.forEach(item => {
+        const c = add(item[0], item[1], item[2] + '（左侧栏兜底：无其它候选）');
+        if (c) c.prio += 60;
+      });
+    }
+
+    // 排序：prio 升序 → 文本越短越像个按钮
+    cands.sort((a, b) => (a.prio - b.prio) || (a.t.length - b.t.length));
+    return { cands: cands.slice(0, 8), scopeWhy, modules: modules.length };
   }
 
-  async function waitForChange(oldFp, timeout) {
+  function findNext(docs, opts) {
+    const { cands } = collectNextCandidates(docs, opts);
+    return cands[0] || null;
+  }
+
+  // 等“任务点是否真的切换了”（比整页指纹更贴合本场景）
+  async function waitForTaskSwitch(oldSig, timeout) {
     const start = Date.now();
     while (Date.now() - start < timeout) {
-      await sleep(600);
-      if (fingerprint(getAllDocs()) !== oldFp) { await sleep(1500); return true; }
+      await sleep(500);
+      if (taskSignature(getAllDocs()) !== oldSig) { await sleep(1200); return true; }
     }
+    return false;
+  }
+
+  // 逐个尝试候选：点完没跳转就把这个元素拉黑、换下一个，
+  // 而不是像旧版那样反复点同一个元素（这是“卡住/提前收工”的根因）。
+  async function clickNextWithRetry(cands, isVideo) {
+    for (const c of cands) {
+      if (!running) return false;
+      const before = taskSignature(getAllDocs());
+      highlight(c.el);
+      log(`→ 点击「${c.t}」${elDesc(c.el)} @ ${docDesc(c.doc)}｜${c.why}`);
+      try { c.el.scrollIntoView({ block: 'center' }); } catch (e) {}
+      await sleep(400);
+      nativeClick(c.el);
+      const changed = await waitForTaskSwitch(before, CONFIG.TASK_SWITCH_TIMEOUT);
+      if (changed) {
+        clearHighlight();
+        log(isVideo ? '视频页已推进 → 该视频对应的答题区' : '已推进到下一个任务点', 'ok');
+        resetBadNext();
+        await sleep(600);
+        return true;
+      }
+      badNextEls.add(c.el);
+      log(`点击「${c.t}」后任务点内容没变化，拉黑该元素并换下一个候选`, 'warn');
+      await handlePopups(getAllDocs(), { wait: false });
+      await sleep(400);
+    }
+    clearHighlight();
+    // 所有候选都失败时，再兜底处理一次可能挡路的弹窗（例如“任务点未完成”提示）
+    await handlePopups(getAllDocs(), { wait: true });
     return false;
   }
 
@@ -1221,12 +1449,13 @@
   }
 
   async function mainLoop() {
-    let noNextRetries = 0;  // 找不到“下一节”按钮的连续轮数
-    let noChangeStreak = 0; // 点击下一节后页面无变化的连续次数
+    let noNextRetries = 0;   // 连续“找不到可用下一节”的轮数
+    let guard = 0;           // 安全阀，防止死循环
     while (running) {
       await sleep(CONFIG.STEP_DELAY);
       if (!running) break;
-      setStatus(`扫描页面（第 ${sections + 1} 节）…`);
+      if (++guard > 3000) { log('安全阀触发：循环次数异常，已停止', 'warn'); break; }
+      setStatus(`扫描页面（已推进 ${sections} 步）…`);
       const docs = getAllDocs();
       await scrollAll(docs);
       await handlePopups(docs, { wait: false });
@@ -1236,64 +1465,164 @@
 
       if (unanswered.length) {
         noNextRetries = 0;
-        noChangeStreak = 0;
         log(`发现 ${questions.length} 道题，其中 ${unanswered.length} 道未作答`);
         const ok = await answerQuestions(unanswered);
         if (!ok && !running) break;
         await sleep(1000);
         await autoSubmit(getAllDocs());
+        resetBadNext();
         await sleep(1500);
         continue;
       }
 
       if (questions.length) {
         noNextRetries = 0;
-        noChangeStreak = 0;
         log(`本节 ${questions.length} 道题均已作答，检查提交…`);
         await autoSubmit(docs);
+        resetBadNext();
         await sleep(1500);
       }
 
-      // 本页无题目：视频/文档/过渡页，只找内容区“下一节”（绝不点目录树，防止跳过章节检测）
+      // 本页没有未答题目：视频任务点 / 文档 / 过渡页 → 找“下一节”推进任务点
       const isVideo = isVideoPageDetect(docs);
-      const next = findNext(docs);
-      if (next) {
+      const { cands, scopeWhy } = collectNextCandidates(docs, { video: isVideo });
+      if (cands.length) {
         noNextRetries = 0;
-        sections++;
-        if (sections > CONFIG.MAX_SECTIONS) { log('达到最大节数限制，停止', 'warn'); break; }
-        log(isVideo
-          ? `本页为视频任务点，点击「${next.t}」继续（已推进 ${sections} 步）`
-          : `本页无题目，点击「${next.t}」继续（已推进 ${sections} 步）`, 'ok');
-        try { next.el.scrollIntoView({ block: 'center' }); } catch (e) {}
-        await sleep(400);
-        const fp = fingerprint(getAllDocs());
-        nativeClick(next.el);
-        const changed = await waitForChange(fp, CONFIG.PAGE_TIMEOUT);
-        if (!changed) {
-          noChangeStreak++;
-          if (noChangeStreak >= 3) {
-            log('连续 3 次点击下一节页面未变化，判定本课程已结束，停在当前页', 'ok');
+        if (isVideo) {
+          log(`本页为视频任务点（不碰播放器，只点它下面的“下一节”推进到对应答题区）｜${scopeWhy}`, 'ok');
+        } else {
+          log(`本页无题目，准备点“下一节”推进｜${scopeWhy}`);
+        }
+        cands.slice(0, 3).forEach((c, i) => log(`  候选${i + 1}：${elDesc(c.el)}「${c.t}」@ ${docDesc(c.doc)}｜${c.why}`));
+        const advanced = await clickNextWithRetry(cands, isVideo);
+        if (advanced) {
+          sections++;
+          if (sections > CONFIG.MAX_SECTIONS) { log('达到最大节数限制，停止', 'warn'); break; }
+        } else {
+          noNextRetries++;
+          if (noNextRetries >= CONFIG.NO_NEXT_RETRIES) {
+            log('本页所有“下一节”候选点击后任务点都没变化，判定本课程已结束，停在当前页', 'ok');
             break;
           }
-          log('页面似乎未变化，关闭弹窗后重试…', 'warn');
-          await handlePopups(getAllDocs(), { wait: true });
+          log(`候选按钮全部无效（${noNextRetries}/${CONFIG.NO_NEXT_RETRIES}），滚动后重试…`, 'warn');
           await scrollAll(getAllDocs());
-        } else {
-          noChangeStreak = 0;
+          await sleep(800);
         }
       } else {
         noNextRetries++;
-        noChangeStreak = 0;
         if (noNextRetries >= CONFIG.NO_NEXT_RETRIES) {
           log('本页无题目，也找不到下一节按钮，判定本课程已结束，停在当前页', 'ok');
           break;
         }
-        log(`未识别到题目，也未找到下一节按钮（${noNextRetries}/${CONFIG.NO_NEXT_RETRIES}），滚动后重试…`, 'warn');
+        log(`未识别到题目，也未找到下一节按钮（${noNextRetries}/${CONFIG.NO_NEXT_RETRIES}）｜${scopeWhy}，滚动后重试…`, 'warn');
         await scrollAll(docs);
         await sleep(500);
       }
     }
     finish();
+  }
+
+  /* ------------------------ 自检 / 手动校准 ------------------------ */
+
+  // 生成一个尽量稳定的 CSS 路径（拾取时用）
+  function cssPath(el) {
+    const parts = [];
+    let cur = el, depth = 0;
+    while (cur && cur.nodeType === 1 && depth < 6) {
+      if (cur.id && /^[A-Za-z][\w-]*$/.test(cur.id)) { parts.unshift('#' + cur.id); break; }
+      let sel = cur.tagName.toLowerCase();
+      const cls = (typeof cur.className === 'string' ? cur.className : '')
+        .trim().split(/\s+/).filter(c => c && /^[A-Za-z][\w-]*$/.test(c)).slice(0, 2);
+      if (cls.length) sel += '.' + cls.join('.');
+      const p = cur.parentElement;
+      if (p) {
+        const sibs = Array.from(p.children).filter(c => c.tagName === cur.tagName);
+        if (sibs.length > 1) sel += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
+      }
+      parts.unshift(sel);
+      cur = cur.parentElement;
+      depth++;
+    }
+    return parts.join(' > ');
+  }
+
+  // 🧭 扫描自检：把脚本的判定依据全部打出来，在真实页面 2 秒验收
+  function scanReport() {
+    const docs = getAllDocs();
+    const { modules } = splitDocs(docs);
+    const isVideo = isVideoPageDetect(docs);
+    const L = [];
+    L.push(`文档数 ${docs.length}（顶层 1，iframe ${docs.length - 1}，任务点 iframe ${modules.length}）`);
+    docs.forEach(d => {
+      let q = 0, v = 0;
+      try {
+        q = d.querySelectorAll(CONFIG.QUESTION_BLOCK_SEL).length;
+        v = d.querySelectorAll('video,.vjs-tech,.vjs-player').length;
+      } catch (e) {}
+      L.push(`  · ${docDesc(d)}｜题目块 ${q}｜播放器 ${v}`);
+    });
+    L.push(`是否判定为视频页：${isVideo ? '是' : '否'}`);
+    L.push(`手动拾取：${CONFIG.NEXT_BTN_PICKED || '（未设置，走自动识别）'}`);
+    const { cands, scopeWhy } = collectNextCandidates(docs, { video: isVideo });
+    L.push(`搜索范围：${scopeWhy}`);
+    if (!cands.length) {
+      L.push('下一节候选：无 → 脚本会判定“本课程已结束”');
+    } else {
+      L.push(`下一节候选（按优先级）：共 ${cands.length} 个，脚本先点第 1 个`);
+      cands.forEach((c, i) => L.push(`  #${i + 1} prio=${c.prio}「${c.t}」${elDesc(c.el)} @ ${docDesc(c.doc)}｜${c.why}`));
+      if (cands.length > 1) L.push('  （第 1 个点了任务点没变化会自动换下一个，无需手动干预）');
+    }
+    const report = L.join('\n');
+    console.log('[DS答题-扫描自检]\n' + report);
+    report.split('\n').forEach(l => log('  ' + l));
+    log(copyText(report) ? '报告已复制到剪贴板，可直接粘贴给我' : '复制失败，请按 F12 在控制台查看', 'ok');
+  }
+
+  // 🎯 手动拾取「下一节」按钮（支持 iframe 内），优先级最高
+  let picking = false;
+  let pickDocs = [];
+  const pickMove = e => {
+    const el = e.target;
+    if (!el || !el.closest || el.closest('#glm-panel')) return;
+    highlight(el);
+  };
+  const pickClick = e => {
+    const el = e.target;
+    if (!el || !el.closest || el.closest('#glm-panel')) return;
+    if (e.preventDefault) e.preventDefault();
+    if (e.stopPropagation) e.stopPropagation();
+    const path = cssPath(el);
+    if (!path) { log('没能生成选择器，换个更靠里的元素再点一次', 'warn'); return; }
+    CONFIG.NEXT_BTN_PICKED = path;
+    saveSettings({ nextPick: path });
+    log(`已绑定「下一节」按钮：${path}（优先级最高，改版后重新拾取即可）`, 'ok');
+    stopPicker();
+    refreshPickInfo();
+  };
+  function stopPicker() {
+    picking = false;
+    pickDocs.forEach(d => {
+      try {
+        d.removeEventListener('mousemove', pickMove, true);
+        d.removeEventListener('click', pickClick, true);
+      } catch (e) {}
+    });
+    pickDocs = [];
+    clearHighlight();
+    if (ui.pickBtn) ui.pickBtn.textContent = '🎯 拾取「下一节」按钮';
+  }
+  function togglePicker() {
+    if (picking) { stopPicker(); log('已退出拾取模式', 'warn'); return; }
+    picking = true;
+    pickDocs = getAllDocs();
+    pickDocs.forEach(d => {
+      try {
+        d.addEventListener('mousemove', pickMove, true);
+        d.addEventListener('click', pickClick, true);
+      } catch (e) {}
+    });
+    if (ui.pickBtn) ui.pickBtn.textContent = '✖ 退出拾取';
+    log('拾取模式：把鼠标移到视频下面那个「下一节」按钮上，点一下即可绑定（不会真的跳转）', 'warn');
   }
 
   function start() {
@@ -1333,6 +1662,16 @@
     ui.stop.style.display = 'none';
     log('=== 任务结束 ===', 'ok');
   }
+
+  // 调试/自检钩子（无头回归测试和你在控制台手动验证都用它）
+  try {
+    const w = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+    w.__XXT_DEBUG__ = {
+      CONFIG, getAllDocs, splitDocs, collectNextCandidates, findNext, isVideoPageDetect,
+      taskSignature, scanReport, cssPath, elDesc, docDesc, isInCatalog, isInLeftRail, resetBadNext,
+      clickNextWithRetry, setRunning: v => { running = !!v; }
+    };
+  } catch (e) {}
 
   // 启动面板（等 body）
   if (document.body) buildUI();
