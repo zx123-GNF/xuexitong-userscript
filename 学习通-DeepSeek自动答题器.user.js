@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.0.0
-// @description  学习通(超星)章节/作业/测验页面：填入自己的 DeepSeek API Key，点击启动后自动识别题目并调用 DeepSeek 作答（字体加密题自动截图走视觉识别），自动提交、自动下一节。v3.0.0 修复“找下一节时点到左侧目录树”的 bug：目录/左侧栏硬排除 + 视频页优先点播放器下方的按钮 + 候选逐个点击校验 + 手动拾取校准。
+// @version      3.1.0
+// @description  学习通(超星)章节/作业/测验页面：填入自己的 DeepSeek API Key，点击启动后自动识别题目并调用 DeepSeek 作答（字体加密题自动截图走视觉识别），自动提交、自动下一节。v3.0.0 修复“找下一节时点到左侧目录树”；v3.1.0 改为优先点开同小节的「章节测验」任务点（不再直接跳过小节），并修好多选题只选一个/点了不生效的问题。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -71,6 +71,12 @@
     NEXT_BAR_SEL: '.jb_btn, .jb-btn, .j-b-btn, .control, .controls, .btn-group, .btnGroup, .footBtn, .foot_btn, .pageBtn, .page_btn, .nav-btn, .navBtn, .bottom-btn, .bottomBtn, .btns, .nextBar, .ans-job, .taskPoint, .catalogue_card_footer',
     // 下一节按钮文本（只点任务点级别的“下一节”，严禁“下一章/下一单元”——那会跳过本章检测）
     NEXT_BTN_TEXT: ['下一节', '下一页', '下一讲', '下一课时', '继续学习', '下一个', 'Next'],
+    // 同小节内的任务点标签文本：视频看完后要先把这些标签点开（章节测验），而不是跳下一个小节
+    TASK_TAB_TEXT: ['章节测验', '章节测试', '章节检测', '章节作业', '课后测验', '单元测验', '章节练习', '小测验', '测验', '测试', '作业', '考试', '讨论'],
+    // 任务点标签可能的容器
+    TASK_TAB_SEL: '.ans-job-list,.job-list,.joblist,.taskPoint,.task-point,.point-list,.pointList,.chapterJob,.chapter-job,#ans-job-list,.jobTab,.job-tab,.tab-item,.nav-item,.ans-job,[class*="jobTab"],[class*="jobList"],[class*="job-list"],[class*="taskPoint"],[class*="task-point"]',
+    // 手动拾取的「章节测验」标签选择器（优先级最高）
+    TASK_TAB_PICKED: '',
     // 课程目录树/章节导航容器：这些区域内的任何链接都不点
     CATALOG_SEL: [
       '#chapterList', '.chapterList', '.chapter-list', '#coursetree', '.coursetree', '.course-tree',
@@ -85,10 +91,22 @@
       '.posCatalog_tit', '.posCatalog_box', '.posCatalog_list', '.posCatalog_item',
       '.catalog_body', '.catalogBody', '.chapter_body', '.chapterBox',
       '.zjlist', '.zj_list', '.s-point-item', '.knowledge-item', '.knowledgeItem',
-      '.treebox', '#treebox', '.ztree', 'ul.ztree', '.joblist', '.jobList', '.ans-job-list',
+      '.treebox', '#treebox', '.ztree', 'ul.ztree',
       '.chapterlist', '.chapter-tree', '.chapterTree', '.dirbox', '.sideCatalog',
       '[id*="catalog"]', '[id*="Catalog"]', '[class*="chapterList"]', '[class*="chapter_list"]',
       '[class*="coursetree"]', '[class*="courseTree"]'
+    ].join(','),
+    // 精确的“章节树”容器：只放确定是左侧目录的东西。
+    // 任务点标签（「2 章节测验」）用这一套判断，避免 .chapterContent/.menu 这类宽泛容器
+    // 把顶部的任务点栏一起排掉 —— 那会让“先切章节测验”直接失效。
+    CATALOG_STRICT_SEL: [
+      '#chapterList', '.chapterList', '.chapter-list', '#coursetree', '.coursetree', '.course-tree',
+      '.posCatalog', '.posCatalog_select', '.posCatalog_scroll', '.posCatalog_content',
+      '.posCatalog_tit', '.posCatalog_box', '.posCatalog_list', '.posCatalog_item',
+      '.ztree', 'ul.ztree', '#treebox', '.treebox', '.ncells', '.ncells_content',
+      '.chapter_item', '.chapter-item', '.chapterItem', '.chapterNum', '.chapter_name', '.chapter-text',
+      '.dirList', '.dir-list', '.knowledgeItem', '.section-list', '.sectionList', '.knowledge-list',
+      '[class*="catalog"]', '[id*="catalog"]', '[class*="chapterList"]', '[class*="coursetree"]'
     ].join(','),
     // 任务点 iframe 特征：命中说明顶层文档只是外壳，目录树和顶部导航都在顶层
     MODULE_IFRAME_RE: /ananas\/modules|\/work\/|doHomeWorkNew|knowledge\/cards|object\/log|video\/index|\/video\/|\/pdf\/|\/audio\/|exam-ans|examtopic/i,
@@ -120,6 +138,7 @@
       if (typeof s.autoSubmit === 'boolean') CONFIG.AUTO_SUBMIT = s.autoSubmit;
       if (typeof s.subjective === 'boolean') CONFIG.ENABLE_SUBJECTIVE = s.subjective;
       if (typeof s.nextPick === 'string') CONFIG.NEXT_BTN_PICKED = s.nextPick;
+      if (typeof s.tabPick === 'string') CONFIG.TASK_TAB_PICKED = s.tabPick;
     } catch (e) {}
   }
   function saveSettings(patch) {
@@ -199,10 +218,13 @@
           <button id="glm-scan" style="background:#2f7f6f;flex:1">🧭 扫描自检</button>
         </div>
         <div class="row">
-          <button id="glm-pick" style="background:#8a5cc4;flex:1">🎯 拾取「下一节」按钮</button>
-          <button id="glm-pickclear" style="background:#555f70;flex:0 0 56px">清除</button>
+          <button id="glm-pick" style="background:#8a5cc4;flex:1">🎯 拾取「下一节」</button>
+          <button id="glm-picktab" style="background:#8a5cc4;flex:1">🎯 拾取「章节测验」</button>
         </div>
-        <div class="row"><div id="glm-pickinfo" style="font-size:11px;opacity:.75;line-height:1.45">下一节按钮：自动识别</div></div>
+        <div class="row">
+          <button id="glm-pickclear" style="background:#555f70;flex:1">清除所有手动拾取</button>
+        </div>
+        <div class="row"><div id="glm-pickinfo" style="font-size:11px;opacity:.75;line-height:1.45">自动识别中</div></div>
         <div class="log" id="glm-log"></div>
       </div>`;
     document.body.appendChild(panel);
@@ -246,15 +268,18 @@
     };
     panel.querySelector('#glm-diag').onclick = () => diagnose();
     panel.querySelector('#glm-scan').onclick = () => scanReport();
-    panel.querySelector('#glm-pick').onclick = () => togglePicker();
+    panel.querySelector('#glm-pick').onclick = () => togglePicker('next');
+    panel.querySelector('#glm-picktab').onclick = () => togglePicker('tab');
     panel.querySelector('#glm-pickclear').onclick = () => {
       CONFIG.NEXT_BTN_PICKED = '';
-      saveSettings({ nextPick: '' });
+      CONFIG.TASK_TAB_PICKED = '';
+      saveSettings({ nextPick: '', tabPick: '' });
       refreshPickInfo();
-      log('已清除手动拾取的下一节按钮，改回自动识别', 'warn');
+      log('已清除所有手动拾取，改回自动识别', 'warn');
     };
     ui.pickInfo = panel.querySelector('#glm-pickinfo');
     ui.pickBtn = panel.querySelector('#glm-pick');
+    ui.pickTabBtn = panel.querySelector('#glm-picktab');
     refreshPickInfo();
     panel.querySelector('#glm-min').onclick = () => panel.classList.toggle('collapsed');
     makeDraggable(panel, panel.querySelector('.hd'));
@@ -271,9 +296,9 @@
 
   function refreshPickInfo() {
     if (!ui.pickInfo) return;
-    ui.pickInfo.textContent = CONFIG.NEXT_BTN_PICKED
-      ? '下一节按钮：已手动绑定 ' + CONFIG.NEXT_BTN_PICKED
-      : '下一节按钮：自动识别（万一又点错，用 🎯 拾取点一下真按钮）';
+    ui.pickInfo.textContent =
+      '下一节：' + (CONFIG.NEXT_BTN_PICKED ? '已手动绑定' : '自动识别') +
+      ' ｜ 章节测验：' + (CONFIG.TASK_TAB_PICKED ? '已手动绑定' : '自动识别');
   }
 
   function makeDraggable(el, handle) {
@@ -384,7 +409,9 @@
   }
 
   /* ---------------------------- 题目采集 ---------------------------- */
-  const TYPE_RE = /(单选题|单项选择题|多选题|多项选择题|判断题|是非题|填空题|简答题|问答题|论述题|名词解释|计算题|分析题)/;
+  const TYPE_RE = /(单项选择题|不定项选择题|多项选择题|单选题|单项选择|多选题|判断题|是非题|填空题|简答题|问答题|论述题|名词解释|计算题|分析题)/;
+  // 多选判定：学习通经常只写「（多选）」「多项」，所以不能只认“多选题”三个字
+  const MULTI_RE = /多选|多项|不定项/;
 
   function collectQuestions(docs) {
     const questions = [];
@@ -423,12 +450,15 @@
         // 题型
         const blockText = cleanText(box.textContent);
         let type = (blockText.match(TYPE_RE) || [])[0] || '';
+        // 多选判定：文本带“多选/多项/不定项”（常写成「（多选）」）或有原生 checkbox
+        const multiHint = MULTI_RE.test(blockText) || inputs.some(x => x.type === 'checkbox');
         if (!type) {
           if (textareas.length && CONFIG.ENABLE_SUBJECTIVE) type = '简答题';
           else if (fillInputs.length) type = '填空题';
-          else if (inputs.some(x => x.type === 'checkbox')) type = '多选题';
+          else if (multiHint) type = '多选题';
           else if (inputs.length) type = '单选题';
         }
+        const isMulti = multiHint || MULTI_RE.test(type);
         if (/简答|问答|论述|名词解释|计算|分析/.test(type) && !CONFIG.ENABLE_SUBJECTIVE) return;
 
         // 题干
@@ -505,7 +535,7 @@
         else if (textareas.length) answered = textareas.every(t => t.value.trim().length > 5);
 
         questions.push({
-          doc, box, type, title, options, inputs, fillInputs, textareas, answered, encrypted,
+          doc, box, type, title, options, inputs, fillInputs, textareas, answered, encrypted, isMulti,
           index: questions.length + 1
         });
       });
@@ -646,7 +676,7 @@
       '[{"index":题号,"answer":["A"]}]\n' +
       '规则：\n' +
       '1. 单选题、判断题：answer 只含1个选项字母；判断题“正确/对/√”选对应正确项字母，“错误/错/×”选错误项字母。\n' +
-      '2. 多选题：answer 含多个字母，按字母顺序。\n' +
+      '2. 多选题：answer 必须包含【全部】正确选项字母（通常至少 2 个），按字母顺序，例如 ["A","C"]；绝不能只给一个字母。\n' +
       '3. 填空题：answer 是与空数相同的字符串数组，每个元素为一个空的答案。\n' +
       '4. 简答题：answer 只含1个字符串，为完整参考答案（100字以内）。\n\n题目如下：\n';
     questions.forEach(q => {
@@ -682,6 +712,25 @@
       });
     }
     return result;
+  }
+
+  // 把模型返回的答案规范成字母数组。
+  // 兼容：["A","C"]（数组）、"AC" / "A,C" / "A、C" / "A B"（多选答案被挤成一个字符串）、全角字母。
+  // 注意不能无脑扫全部 [A-Z]，否则 "A. DNA复制" 会被拆成 A/D/N/A。
+  function extractLetters(ans) {
+    const items = (Array.isArray(ans) ? ans : [ans])
+      .map(x => String(x == null ? '' : x).trim())
+      .filter(Boolean)
+      .map(s => s.replace(/[\uFF21-\uFF3A]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)));
+    if (!items.length) return [];
+    // 情形一：整个答案就是“字母 + 分隔符”，直接拆开
+    if (items.length === 1 && /^[A-Za-z\s、．,，:：\/\(\)（）]*$/.test(items[0])) {
+      const uniq = Array.from(new Set(items[0].toUpperCase().match(/[A-Z]/g) || []));
+      if (uniq.length) return uniq;
+    }
+    // 情形二：数组里每项是一个字母
+    const firsts = items.map(s => (s.toUpperCase().match(/[A-Z]/) || [''])[0]).filter(Boolean);
+    return Array.from(new Set(firsts));
   }
 
   /* ---------------------------- 执行作答 ---------------------------- */
@@ -743,23 +792,46 @@
         const ta = q.textareas[0];
         if (ta) { setNativeValue(ta, ans[0].toString()); log(`第 ${q.index} 题（简答）已填写`, 'ok'); }
       } else {
-        // 选择/判断题：按字母点击，字母对不上则按文本模糊匹配
+        // 选择/判断题：先规范成字母列表 → 逐个点击 → 校验 → 没选上的补点一次
         const picked = [];
-        ans.forEach(a => {
-          const letter = String(a).trim().charAt(0).toUpperCase();
-          let opt = q.options.find(o => o.letter === letter);
-          if (!opt) {
-            const kw = String(a).replace(/^[A-Z][\.、．\s]*/, '').trim();
-            if (kw) opt = q.options.find(o => o.text && (o.text.includes(kw) || kw.includes(o.text.slice(2))));
-          }
-          if (opt && !picked.includes(opt)) picked.push(opt);
-        });
+        const pushOpt = opt => { if (opt && !picked.includes(opt)) picked.push(opt); };
+
+        extractLetters(ans).forEach(letter => pushOpt(q.options.find(o => o.letter === letter)));
+
+        // 字母对不上：按答案文本反查选项
+        if (!picked.length) {
+          ans.forEach(a => {
+            const kw = String(a).replace(/^[A-Za-z][\.、．\s]*/, '').trim();
+            if (!kw) return;
+            pushOpt(q.options.find(o => o.text && (o.text.includes(kw) || kw.includes(o.text.slice(2).trim()))));
+          });
+        }
+        // 判断题兜底：正确/对/√/是 与 错误/错/×/否 直接对选项文本
+        if (!picked.length) {
+          const raw = ans.map(String).join(' ');
+          const wantTrue = /正确|对|是|√|true|\bT\b/i.test(raw);
+          const wantFalse = /错误|错|否|×|false|\bF\b/i.test(raw);
+          const re = wantTrue ? /正确|对|是|√|true/i : (wantFalse ? /错误|错|否|×|false/i : null);
+          if (re) pushOpt(q.options.find(o => re.test(o.text)));
+        }
+
         if (picked.length) {
-          for (const opt of picked) {
-            const ok = await clickOption(opt);
-            if (!ok) log(`第 ${q.index} 题选项 ${opt.letter} 可能未选中，请人工检查`, 'warn');
+          const isMulti = q.isMulti || picked.length > 1;
+          for (const opt of picked) await clickOption(opt, isMulti);
+
+          // 多选题/多选题式点击最容易“点了没生效”，这里统一复检并补点一次
+          let missing = picked.filter(o => !optionSelected(o));
+          if (missing.length) {
+            await sleep(200);
+            for (const opt of missing) await clickOption(opt, isMulti);
+            missing = picked.filter(o => !optionSelected(o));
           }
-          log(`第 ${q.index} 题（${q.type}）选择：${picked.map(o => o.letter).join('、')}`, 'ok');
+          log(`第 ${q.index} 题（${q.type || (isMulti ? '多选题' : '单选题')}）已选：${picked.map(o => o.letter).join('、')}`
+            + (missing.length ? `｜警告：${missing.map(o => o.letter).join('、')} 仍未选中` : ''),
+            missing.length ? 'warn' : 'ok');
+          if (isMulti && picked.length < 2) {
+            log(`第 ${q.index} 题判定为多选题，但只拿到 1 个答案（${ans.join(',')}），可能漏选，请人工确认`, 'err');
+          }
         } else {
           log(`第 ${q.index} 题答案无法匹配选项：${ans.join(',')}`, 'warn');
         }
@@ -779,7 +851,7 @@
 
   // 学习通不同版本：新版 li 上有 onclick="addChoice(this)"（最可靠，直接调用页面函数）；
   // 老版事件绑在 li / a.before / label / 原生 input。逐级尝试，每步校验选中状态。
-  async function clickOption(opt) {
+  async function clickOption(opt, isMulti) {
     const sleep120 = () => new Promise(r => setTimeout(r, 120));
     const li = opt.li || (opt.el.tagName === 'LI' ? opt.el : opt.el);
     const tryClick = el => {
@@ -840,8 +912,9 @@
         li.setAttribute('aria-checked', 'true');
         li.setAttribute('aria-pressed', 'true');
         const ul = li.closest('ul');
-        // 单选：同组其他项取消
-        if (ul && !/多选|多项/.test((li.closest('.TiMu')?.textContent || ''))) {
+        // 单选：同组其他项取消。多选【绝对不能清】，否则会把刚选上的答案抹掉
+        const multi = isMulti === true || MULTI_RE.test(li.closest('.TiMu')?.textContent || '');
+        if (ul && !multi) {
           ul.querySelectorAll('li').forEach(x => {
             if (x !== li && x.getAttribute('aria-checked') === 'true') {
               x.setAttribute('aria-checked', 'false');
@@ -1032,6 +1105,7 @@
       if (extraSel) els = els.concat(Array.from(doc.querySelectorAll(extraSel)));
       els.forEach(el => {
         if (!isVisible(el)) return;
+        if (isOwnUI(el)) return;
         const t = cleanText(el.textContent || el.value || '');
         if (!t || t.length > 12) return;
         if (CONFIG.EXCLUDE_TEXT.some(x => t.includes(x))) return;
@@ -1059,6 +1133,17 @@
     try {
       return !!(el.closest && el.closest(CONFIG.CATALOG_SEL));
     } catch (e) { return false; }
+  }
+
+  // 元素是否属于脚本自己的面板。面板上写着「章节测验」「下一节」等字样，
+  // 不排掉会被当成任务点标签点掉（实测踩过这个坑）。
+  function isOwnUI(el) {
+    try { return !!(el && el.closest && el.closest('#glm-panel')); } catch (e) { return false; }
+  }
+
+  // 精确目录判定（任务点标签专用）：只认确定的章节树容器
+  function isInCatalogStrict(el) {
+    try { return !!(el && el.closest && el.closest(CONFIG.CATALOG_STRICT_SEL)); } catch (e) { return false; }
   }
 
   /* =============== v3.0.0 新增：下一节解析基础设施 =============== */
@@ -1121,6 +1206,7 @@
   function rejectReason(el, doc, opts) {
     opts = opts || {};
     if (!el || el.nodeType !== 1) return '不是元素';
+    if (isOwnUI(el)) return '是脚本自己的面板';
     if (!isVisible(el)) return '不可见';
     if (isDisabled(el)) return '已禁用';
     if (el === document.body || el === document.documentElement) return '根节点';
@@ -1396,6 +1482,93 @@
     return cands[0] || null;
   }
 
+  /* --------- 同小节内的任务点标签（视频 → 章节测验） ---------
+   * 学习通一个「小节」里通常有多个任务点，例如「1 视频」「2 章节测验」。
+   * 视频看完后如果直接点底部「下一节」，会跳到下一个小节，把本章测验整段跳过。
+   * 所以：当前页没有题目时，先把还没做的任务点标签点开；确实没有标签才点「下一节」。
+   * 这里只负责“找”，失败拉黑/换下一个由 clickNextWithRetry 统一处理。
+   */
+  let visitedTabs = new Set();     // 本小节内已经点过的任务点标签，防止任务点之间来回横跳
+  function resetVisitedTabs() { visitedTabs = new Set(); }
+
+  // 当前正在展示的任务点标签（带 active/cur 高亮，或 aria-selected）
+  function isActiveTab(el) {
+    let cur = el;
+    for (let i = 0; i < 2 && cur && cur.nodeType === 1; i++) {
+      const cls = typeof cur.className === 'string' ? cur.className : '';
+      if (/active|current|(^|\s)cur(\s|$)|selected|checked/i.test(cls)) return true;
+      if (cur.getAttribute && (cur.getAttribute('aria-selected') === 'true' || cur.getAttribute('aria-current') === 'true')) return true;
+      cur = cur.parentElement;
+    }
+    // 'on' 太容易误判，只看元素自己
+    return /(^|\s)on(\s|$)/.test(typeof el.className === 'string' ? el.className : '');
+  }
+
+  function collectTaskTabs(docs) {
+    const out = [];
+    const seen = new Set();
+    const topDoc = window.top.document;
+
+    const accept = (el, doc) => {
+      if (!el || el.nodeType !== 1 || seen.has(el)) return;
+      if (isOwnUI(el)) return;
+      if (!isVisible(el) || isDisabled(el)) return;
+      if (isInCatalogStrict(el) || isInLeftRail(el, doc)) return;
+      if (isActiveTab(el)) return;                     // 正在看的任务点，不再点
+      if (badNextEls.has(el)) return;
+      const t = cleanText(el.textContent || el.value || '');
+      if (!t || t.length > 14) return;
+      if (!CONFIG.TASK_TAB_TEXT.some(k => t.includes(k))) return;
+      if (CONFIG.NEXT_BTN_TEXT.some(k => t.includes(k))) return;   // 别把“下一节”当标签
+      if (CONFIG.EXCLUDE_TEXT.some(k => t.includes(k))) return;
+      if (el.children && el.children.length > 2) return;           // 包一堆子元素的是大容器
+      seen.add(el);
+      const ki = CONFIG.TASK_TAB_TEXT.findIndex(k => t.includes(k));
+      let prio = 20 + Math.max(0, ki) + (doc === topDoc ? 0 : 25);
+      if (/^\d/.test(t)) prio -= 6;                                // “2 章节测验”这种带序号的更像任务点
+      if (/^(A|BUTTON)$/.test(el.tagName) || el.getAttribute('role') === 'button') prio -= 4;
+      if (!el.children || el.children.length === 0) prio -= 6;      // 叶子才是真标签，整条标签栏是容器
+      out.push({ el, doc, t, why: '任务点标签', prio, key: t.replace(/\s+/g, '') });
+    };
+
+    // 0) 手动拾取（放宽文本要求，但“当前打开的任务点”仍然跳过，否则会死循环）
+    if (CONFIG.TASK_TAB_PICKED) {
+      docs.forEach(doc => {
+        let el = null;
+        try { el = doc.querySelector(CONFIG.TASK_TAB_PICKED); } catch (e) {}
+        if (el && !isOwnUI(el) && isVisible(el) && !isDisabled(el) && !isActiveTab(el) && !seen.has(el)) {
+          seen.add(el);
+          out.push({
+            el, doc, t: cleanText(el.textContent) || '任务点', why: '手动拾取的章节测验标签',
+            prio: -100, key: 'picked:' + CONFIG.TASK_TAB_PICKED
+          });
+        }
+      });
+    }
+
+    // 1) 常规扫描
+    docs.forEach(doc => {
+      let els = [];
+      try { els = Array.from(doc.querySelectorAll(CLICKABLE_SEL + ',' + CONFIG.TASK_TAB_SEL)); } catch (e) {}
+      els.forEach(el => {
+        const t = cleanText(el.textContent || el.value || '');
+        if (!t || t.length > 14) return;
+        if (!CONFIG.TASK_TAB_TEXT.some(k => t.includes(k))) return;
+        const cls = typeof el.className === 'string' ? el.className : '';
+        const pcls = (el.parentElement && typeof el.parentElement.className === 'string') ? el.parentElement.className : '';
+        const clickable = el.hasAttribute('onclick') || el.getAttribute('role') === 'button'
+          || /^(A|BUTTON)$/.test(el.tagName)
+          || /tab|item|point|job|btn|nav|node|chip/i.test(cls)
+          || /tab|point|job|btn|nav/i.test(pcls);
+        if (!clickable) return;
+        accept(el, doc);
+      });
+    });
+
+    out.sort((a, b) => (a.prio - b.prio) || (a.t.length - b.t.length));
+    return out.slice(0, 6);
+  }
+
   // 等“任务点是否真的切换了”（比整页指纹更贴合本场景）
   async function waitForTaskSwitch(oldSig, timeout) {
     const start = Date.now();
@@ -1483,13 +1656,32 @@
         await sleep(1500);
       }
 
-      // 本页没有未答题目：视频任务点 / 文档 / 过渡页 → 找“下一节”推进任务点
+      // 本页没有未答题目：视频任务点 / 文档 / 过渡页
       const isVideo = isVideoPageDetect(docs);
+
+      // ① 同一小节里还有没做的任务点（典型：视频看完 →「2 章节测验」）。
+      //    必须优先切任务点：底部那个“下一节”会直接跳到下一个小节，把本章测验整段跳过。
+      if (!questions.length) {
+        const tabs = collectTaskTabs(docs).filter(t => !visitedTabs.has(t.key));
+        if (tabs.length) {
+          noNextRetries = 0;
+          log(`本小节还有未完成的任务点：${tabs.map(t => '「' + t.t + '」').join('、')}，先切过去（不跳小节）`, 'ok');
+          tabs.slice(0, 3).forEach((c, i) => log(`  任务点${i + 1}：${elDesc(c.el)}「${c.t}」@ ${docDesc(c.doc)}`));
+          const switched = await clickNextWithRetry(tabs, false);
+          if (switched) {
+            tabs.forEach(t => visitedTabs.add(t.key));
+            continue;
+          }
+          log('任务点标签点了都没反应，改为找“下一节”', 'warn');
+        }
+      }
+
+      // ② 本小节的任务点都做完了 → 点“下一节”进入下一个小节
       const { cands, scopeWhy } = collectNextCandidates(docs, { video: isVideo });
       if (cands.length) {
         noNextRetries = 0;
         if (isVideo) {
-          log(`本页为视频任务点（不碰播放器，只点它下面的“下一节”推进到对应答题区）｜${scopeWhy}`, 'ok');
+          log(`本页为视频任务点，本小节已无其它未完成任务点，点“下一节”进入下一个小节｜${scopeWhy}`, 'ok');
         } else {
           log(`本页无题目，准备点“下一节”推进｜${scopeWhy}`);
         }
@@ -1497,6 +1689,7 @@
         const advanced = await clickNextWithRetry(cands, isVideo);
         if (advanced) {
           sections++;
+          resetVisitedTabs();          // 换小节了，任务点标签重新计数
           if (sections > CONFIG.MAX_SECTIONS) { log('达到最大节数限制，停止', 'warn'); break; }
         } else {
           noNextRetries++;
@@ -1562,7 +1755,9 @@
       L.push(`  · ${docDesc(d)}｜题目块 ${q}｜播放器 ${v}`);
     });
     L.push(`是否判定为视频页：${isVideo ? '是' : '否'}`);
-    L.push(`手动拾取：${CONFIG.NEXT_BTN_PICKED || '（未设置，走自动识别）'}`);
+    L.push(`手动拾取：下一节=${CONFIG.NEXT_BTN_PICKED || '自动'}｜章节测验=${CONFIG.TASK_TAB_PICKED || '自动'}`);
+    const tabs = collectTaskTabs(docs);
+    L.push(`未完成任务点标签：${tabs.length ? tabs.map(t => '「' + t.t + '」').join('、') : '（无）'}`);
     const { cands, scopeWhy } = collectNextCandidates(docs, { video: isVideo });
     L.push(`搜索范围：${scopeWhy}`);
     if (!cands.length) {
@@ -1578,8 +1773,9 @@
     log(copyText(report) ? '报告已复制到剪贴板，可直接粘贴给我' : '复制失败，请按 F12 在控制台查看', 'ok');
   }
 
-  // 🎯 手动拾取「下一节」按钮（支持 iframe 内），优先级最高
+  // 🎯 手动拾取（支持 iframe 内）：mode = 'next' 绑「下一节」，mode = 'tab' 绑「章节测验」标签
   let picking = false;
+  let pickMode = 'next';
   let pickDocs = [];
   const pickMove = e => {
     const el = e.target;
@@ -1593,9 +1789,15 @@
     if (e.stopPropagation) e.stopPropagation();
     const path = cssPath(el);
     if (!path) { log('没能生成选择器，换个更靠里的元素再点一次', 'warn'); return; }
-    CONFIG.NEXT_BTN_PICKED = path;
-    saveSettings({ nextPick: path });
-    log(`已绑定「下一节」按钮：${path}（优先级最高，改版后重新拾取即可）`, 'ok');
+    if (pickMode === 'tab') {
+      CONFIG.TASK_TAB_PICKED = path;
+      saveSettings({ tabPick: path });
+      log(`已绑定「章节测验」标签：${path}（优先级最高，改版后重新拾取即可）`, 'ok');
+    } else {
+      CONFIG.NEXT_BTN_PICKED = path;
+      saveSettings({ nextPick: path });
+      log(`已绑定「下一节」按钮：${path}（优先级最高，改版后重新拾取即可）`, 'ok');
+    }
     stopPicker();
     refreshPickInfo();
   };
@@ -1609,11 +1811,13 @@
     });
     pickDocs = [];
     clearHighlight();
-    if (ui.pickBtn) ui.pickBtn.textContent = '🎯 拾取「下一节」按钮';
+    if (ui.pickBtn) ui.pickBtn.textContent = '🎯 拾取「下一节」';
+    if (ui.pickTabBtn) ui.pickTabBtn.textContent = '🎯 拾取「章节测验」';
   }
-  function togglePicker() {
+  function togglePicker(mode) {
     if (picking) { stopPicker(); log('已退出拾取模式', 'warn'); return; }
     picking = true;
+    pickMode = mode === 'tab' ? 'tab' : 'next';
     pickDocs = getAllDocs();
     pickDocs.forEach(d => {
       try {
@@ -1621,8 +1825,11 @@
         d.addEventListener('click', pickClick, true);
       } catch (e) {}
     });
-    if (ui.pickBtn) ui.pickBtn.textContent = '✖ 退出拾取';
-    log('拾取模式：把鼠标移到视频下面那个「下一节」按钮上，点一下即可绑定（不会真的跳转）', 'warn');
+    if (ui.pickBtn) ui.pickBtn.textContent = pickMode === 'tab' ? '🎯 拾取「下一节」' : '✖ 退出拾取';
+    if (ui.pickTabBtn) ui.pickTabBtn.textContent = pickMode === 'tab' ? '✖ 退出拾取' : '🎯 拾取「章节测验」';
+    log(pickMode === 'tab'
+      ? '拾取模式：把鼠标移到那一排任务点里的「章节测验」上，点一下即可绑定（不会真的跳转）'
+      : '拾取模式：把鼠标移到视频下面那个「下一节」按钮上，点一下即可绑定（不会真的跳转）', 'warn');
   }
 
   function start() {
@@ -1642,6 +1849,7 @@
     }
     running = true;
     sections = 0;
+    resetVisitedTabs();
     ui.start.style.display = 'none';
     ui.stop.style.display = 'block';
     log(`任务启动，模型：${CONFIG.MODEL}（加密题截图识别固定使用 deepseek-flash）`, 'ok');
@@ -1669,7 +1877,9 @@
     w.__XXT_DEBUG__ = {
       CONFIG, getAllDocs, splitDocs, collectNextCandidates, findNext, isVideoPageDetect,
       taskSignature, scanReport, cssPath, elDesc, docDesc, isInCatalog, isInLeftRail, resetBadNext,
-      clickNextWithRetry, setRunning: v => { running = !!v; }
+      clickNextWithRetry, setRunning: v => { running = !!v; },
+      collectTaskTabs, extractLetters, resetVisitedTabs, visitedTabs: () => visitedTabs,
+      collectQuestions, clickOption, optionSelected, MULTI_RE
     };
   } catch (e) {}
 
