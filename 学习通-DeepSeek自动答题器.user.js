@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.1.0
-// @description  学习通(超星)章节/作业/测验页面：填入自己的 DeepSeek API Key，点击启动后自动识别题目并调用 DeepSeek 作答（字体加密题自动截图走视觉识别），自动提交、自动下一节。v3.0.0 修复“找下一节时点到左侧目录树”；v3.1.0 改为优先点开同小节的「章节测验」任务点（不再直接跳过小节），并修好多选题只选一个/点了不生效的问题。
+// @version      3.2.0
+// @description  学习通(超星)章节/作业/测验页面：填入自己的 DeepSeek API Key，点击启动后自动识别题目并调用 DeepSeek 作答（字体加密题自动截图走视觉识别），自动提交、自动下一节。v3.0.0 修复误点左侧目录；v3.1.0 优先点开「章节测验」任务点；v3.2.0 重写选项点击逻辑（避免多选被双重触发抵消、隐藏答案框改为并集累加），并加入“多选没选全就继续补选”的闭环。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -218,6 +218,9 @@
           <button id="glm-scan" style="background:#2f7f6f;flex:1">🧭 扫描自检</button>
         </div>
         <div class="row">
+          <button id="glm-dump" style="background:#b5651d;flex:1">🔬 导出题目 HTML（多选出问题就点它）</button>
+        </div>
+        <div class="row">
           <button id="glm-pick" style="background:#8a5cc4;flex:1">🎯 拾取「下一节」</button>
           <button id="glm-picktab" style="background:#8a5cc4;flex:1">🎯 拾取「章节测验」</button>
         </div>
@@ -268,6 +271,7 @@
     };
     panel.querySelector('#glm-diag').onclick = () => diagnose();
     panel.querySelector('#glm-scan').onclick = () => scanReport();
+    panel.querySelector('#glm-dump').onclick = () => dumpQuestionDOM();
     panel.querySelector('#glm-pick').onclick = () => togglePicker('next');
     panel.querySelector('#glm-picktab').onclick = () => togglePicker('tab');
     panel.querySelector('#glm-pickclear').onclick = () => {
@@ -518,6 +522,8 @@
             };
           }).filter(o => o.text);
         }
+        // 用统一的选中判定再校正一次（有些版本选中态只体现在子节点的 class 上）
+        options.forEach(o => { if (!o.checked && optionSelected(o)) o.checked = true; });
 
         // 字体加密检测：题块含 font-cxsecret 或 Unicode 私用区字符（截图走视觉模型）
         const encrypted = !!box.querySelector('.font-cxsecret,[class*="cxsecret"]')
@@ -733,6 +739,22 @@
     return Array.from(new Set(firsts));
   }
 
+  /* ---------------- 多选题答案跟踪（反复补选，直到真的选上） ---------------- */
+  // 关键点：多选题只要有一个目标选项没真正选上，主循环就会重试点击，
+  // 而不是因为 answered=true 就当它做完了 —— 这正是“多选只选上一个就跑了”的原因。
+  const multiPlan = new Map();   // 题目 key → { letters: 期望选中的字母, tries: 已补选次数 }
+  function qKeyOf(q) { return ((q.title || '').replace(/\s+/g, '')).slice(0, 60) + '#' + q.options.length; }
+  function selectedLetters(q) {
+    return q.options.filter(o => o.checked || optionSelected(o)).map(o => o.letter);
+  }
+  function pendingMulti(q) {
+    const plan = multiPlan.get(qKeyOf(q));
+    if (!plan || plan.letters.length < 2 || plan.tries >= 5) return null;
+    const sel = selectedLetters(q);
+    const missing = plan.letters.filter(L => sel.indexOf(L) < 0);
+    return missing.length ? { plan, missing } : null;
+  }
+
   /* ---------------------------- 执行作答 ---------------------------- */
   async function answerQuestions(questions) {
     let answers = {};
@@ -829,6 +851,8 @@
           log(`第 ${q.index} 题（${q.type || (isMulti ? '多选题' : '单选题')}）已选：${picked.map(o => o.letter).join('、')}`
             + (missing.length ? `｜警告：${missing.map(o => o.letter).join('、')} 仍未选中` : ''),
             missing.length ? 'warn' : 'ok');
+          // 记下多选的期望答案：只要没选全，主循环会继续补选
+          if (isMulti) multiPlan.set(qKeyOf(q), { letters: picked.map(o => o.letter), tries: 0 });
           if (isMulti && picked.length < 2) {
             log(`第 ${q.index} 题判定为多选题，但只拿到 1 个答案（${ans.join(',')}），可能漏选，请人工确认`, 'err');
           }
@@ -841,96 +865,132 @@
     return true;
   }
 
-  // 综合判定选项是否已选中：aria-checked（新版学习通）/ 原生 checked / 选中类名
+  // 综合判定选项是否已选中：原生 checked / aria-* / 选中类名（自身 + 子节点都看）
+  // 判定要"宽"：宁可认为已选中也不要漏判，否则会出现"点了但脚本以为没点上"而反复点，
+  // 对多选来说反复点 = 来回 toggle = 最后什么也没选上。
   function optionSelected(opt) {
-    const li = opt.li || (opt.el?.tagName === 'LI' ? opt.el : opt.el);
-    if (li?.getAttribute?.('aria-checked') === 'true' || li?.getAttribute?.('aria-pressed') === 'true') return true;
+    const li = opt.li || opt.el;
+    if (!li) return false;
     if (opt.input && opt.input.checked) return true;
-    return /chosen|active|selected|(^|\s)cur(\s|$)|(^|\s)on(\s|$)/.test(li?.className || '');
-  }
-
-  // 学习通不同版本：新版 li 上有 onclick="addChoice(this)"（最可靠，直接调用页面函数）；
-  // 老版事件绑在 li / a.before / label / 原生 input。逐级尝试，每步校验选中状态。
-  async function clickOption(opt, isMulti) {
-    const sleep120 = () => new Promise(r => setTimeout(r, 120));
-    const li = opt.li || (opt.el.tagName === 'LI' ? opt.el : opt.el);
-    const tryClick = el => {
-      if (!el || !isVisible(el)) return;
-      try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
-      nativeClick(el);
-    };
-
-    if (optionSelected(opt)) return true;
-
-    // 1) 新版学习通：直接调用所在 frame 页面里的 addChoice(li)
+    const nodes = [li, opt.label, opt.num];
     try {
-      const win = li.ownerDocument.defaultView;
-      const pageWin = (typeof unsafeWindow !== 'undefined' && win === window.top && unsafeWindow.addChoice)
-        ? unsafeWindow : win;
-      const fn = pageWin.addChoice || win.wrappedJSObject?.addChoice;
-      if (typeof fn === 'function') {
-        try { li.scrollIntoView({ block: 'center' }); } catch (e) {}
-        fn.call(win, li);
-        await sleep120();
+      if (li.querySelectorAll) {
+        nodes.push.apply(nodes, li.querySelectorAll('a.before,i.before,span.before,.num_option,[class*="before"],[class*="letter"]'));
       }
     } catch (e) {}
+    for (const n of nodes) {
+      if (!n || !n.getAttribute) continue;
+      if (n.getAttribute('aria-checked') === 'true' || n.getAttribute('aria-pressed') === 'true'
+        || n.getAttribute('aria-selected') === 'true') return true;
+      const c = typeof n.className === 'string' ? n.className : '';
+      if (/(^|[\s_-])(chosen|active|selected|checked|on)([\s_-]|$)/i.test(c)) return true;
+      if (/(^|\s)cur(\s|$)/i.test(c)) return true;
+    }
+    return false;
+  }
+
+  // 学习通各版本点击方式差别很大。这里的三条原则是这一轮多选修复的核心：
+  //   ① 每点一次都要验证状态真的变了，没变就换下一种方式；
+  //   ② 多选（checkbox）最怕"一次点击被触发两遍" —— li 上的 onclick 和 label 的默认激活
+  //      会同时生效，toggle 两次 = 抵消，表现就是"怎么点都选不上"。所以先走
+  //      addChoice / 原生 input 这种【只触发一次】的路径，点字母标记时才用不冒泡的 click；
+  //   ③ 多选绝不能清除同组其它已选项，否则会把刚选上的答案抹掉。
+  async function clickOption(opt, isMulti) {
+    const li = opt.li || (opt.el && opt.el.tagName === 'LI' ? opt.el : opt.el);
+    if (!li) return false;
+    const blockText = ((li.closest && li.closest('.TiMu')) || {}).textContent || '';
+    const multi = isMulti === true || MULTI_RE.test(blockText);
     if (optionSelected(opt)) return true;
 
-    // 2) 有原生 radio/checkbox：点 字母标记 → li → label → input.click()
+    const win = li.ownerDocument.defaultView;
+    const tick = () => sleep(140);
+    const before = (li.querySelector && li.querySelector('a.before,span.before,i.before,a[class*="before"],.font-label,span[class*="letter"]')) || null;
+
+    // 单次尝试：只有状态真的变化才算成功
+    const attempt = async (how, fn) => {
+      if (optionSelected(opt)) return true;
+      try { fn(); } catch (e) {}
+      await tick();
+      if (optionSelected(opt)) { log(`      选项 ${opt.letter} 选中成功（${how}）`); return true; }
+      return false;
+    };
+
+    // ① 页面自带的 addChoice(li)——和真人点击完全等价，只触发一次
+    try {
+      const pageWin = (typeof unsafeWindow !== 'undefined' && win === window.top && unsafeWindow.addChoice) ? unsafeWindow : win;
+      const fn = pageWin.addChoice || (win.wrappedJSObject && win.wrappedJSObject.addChoice);
+      if (typeof fn === 'function') {
+        if (await attempt('页面 addChoice', () => { try { li.scrollIntoView({ block: 'center' }); } catch (e) {} fn.call(win, li); })) return true;
+      }
+    } catch (e) {}
+
+    // ② 原生 input：单击一次，不会被 label + li 双重触发抵消
     if (opt.input) {
-      const before = li?.querySelector?.('a.before,span.before,a[class*="before"],.font-label')
-        || opt.label?.querySelector?.('a.before,span.before,.font-label');
-      for (const t of [before, li, opt.label].filter(Boolean)) {
-        if (optionSelected(opt)) return true;
-        tryClick(t);
-        await sleep120();
-        if (optionSelected(opt)) return true;
-      }
-      if (!optionSelected(opt)) { try { opt.input.click(); } catch (e) {}; await sleep120(); }
-      if (!optionSelected(opt)) {
-        try {
-          opt.input.checked = true;
-          opt.input.dispatchEvent(new Event('click', { bubbles: true }));
-          opt.input.dispatchEvent(new Event('change', { bubbles: true }));
-          const w = opt.input.ownerDocument.defaultView;
-          if (w?.jQuery) { try { w.jQuery(opt.input).trigger('change'); } catch (e) {} }
-        } catch (e) {}
-        await sleep120();
-      }
-      return optionSelected(opt);
+      if (await attempt('点原生 input', () => { try { opt.input.click(); } catch (e) {} })) return true;
+      if (await attempt('input.checked=true + change', () => {
+        opt.input.checked = true;
+        opt.input.dispatchEvent(new Event('input', { bubbles: true }));
+        opt.input.dispatchEvent(new Event('change', { bubbles: true }));
+        if (win.jQuery) { try { win.jQuery(opt.input).trigger('change'); } catch (e) {} }
+      })) return true;
     }
 
-    // 3) 纯 JS 组件：点 li（一次，重复点会 toggle 取消）
-    const before = li?.querySelector?.('a.before,span.before,a[class*="before"],.font-label');
-    tryClick(li);
-    await sleep120();
-    if (!optionSelected(opt) && before) { tryClick(before); await sleep120(); }
+    // ③ 点 li 本体：事件目标就是 li，label 的默认激活不参与，只触发 li 自己的 onclick
+    if (await attempt('点 li 本体', () => { try { li.scrollIntoView({ block: 'center' }); } catch (e) {} nativeClick(li); })) return true;
 
-    // 4) 最终兜底：手动同步 aria-checked 与隐藏 answer input
-    if (!optionSelected(opt)) {
-      try {
-        li.setAttribute('aria-checked', 'true');
-        li.setAttribute('aria-pressed', 'true');
-        const ul = li.closest('ul');
-        // 单选：同组其他项取消。多选【绝对不能清】，否则会把刚选上的答案抹掉
-        const multi = isMulti === true || MULTI_RE.test(li.closest('.TiMu')?.textContent || '');
-        if (ul && !multi) {
-          ul.querySelectorAll('li').forEach(x => {
-            if (x !== li && x.getAttribute('aria-checked') === 'true') {
-              x.setAttribute('aria-checked', 'false');
-              x.setAttribute('aria-pressed', 'false');
-            }
-          });
-        }
-        const name = opt.num?.getAttribute('name');
-        if (name) {
-          const doc = li.ownerDocument;
-          const hid = doc.getElementById(name) || doc.querySelector(`input[type=hidden][name="${name}"]`);
-          if (hid) setNativeValue(hid, opt.letter);
-        }
-      } catch (e) {}
-      await sleep120();
+    // ④ label（它会激活内部 input）
+    if (opt.label && await attempt('点 label', () => nativeClick(opt.label))) return true;
+
+    // ⑤ 字母标记：先用【不冒泡】的 click，避免同时触发 li 的 onclick 造成多选抵消
+    if (before) {
+      if (await attempt('点字母标记(不冒泡)', () => {
+        before.dispatchEvent(new MouseEvent('click', { bubbles: false, cancelable: true, view: win }));
+      })) return true;
+      if (await attempt('点字母标记(冒泡)', () => nativeClick(before))) return true;
     }
+
+    // ⑥ 纯 JS 组件的最后兜底：手动同步 aria / class / 隐藏答案框
+    try {
+      li.setAttribute('aria-checked', 'true');
+      li.setAttribute('aria-pressed', 'true');
+      if (li.classList) li.classList.add('chosen');
+      if (before && before.classList) before.classList.add('chosen');
+      const ul = li.closest && li.closest('ul');
+      if (ul && !multi) {                       // 单选才清同组；多选绝对不能清
+        ul.querySelectorAll('li').forEach(x => {
+          if (x === li) return;
+          x.setAttribute('aria-checked', 'false');
+          x.setAttribute('aria-pressed', 'false');
+          if (x.classList) x.classList.remove('chosen');
+        });
+      }
+      // 隐藏答案框：只做"并集"累加，绝不覆盖 —— 单选覆盖没事，多选覆盖就只剩最后一个字母。
+      // 注意【必须限定在本题块内】找，否则会把答案写进文档里第一道题的隐藏框（真实踩过）。
+      const name = opt.num && opt.num.getAttribute && opt.num.getAttribute('name');
+      const doc = li.ownerDocument;
+      const box = (li.closest && li.closest(CONFIG.QUESTION_BLOCK_SEL)) || null;
+      const scope = box || doc;
+      const hids = [];
+      if (name) {
+        let e = null;
+        try { e = doc.getElementById(name); } catch (err) {}
+        if (e && (scope === doc || scope.contains(e))) hids.push(e);
+        else if (scope.querySelector) {
+          const e2 = scope.querySelector('input[name="' + name + '"]');
+          if (e2) hids.push(e2);
+        }
+      }
+      const byName = scope.querySelector && scope.querySelector('input[type=hidden][name^="answer"]');
+      if (byName) hids.push(byName);
+      hids.forEach(hid => {
+        const cur = String(hid.value || '');
+        if (!multi) { setNativeValue(hid, opt.letter); return; }
+        const set = new Set(cur.toUpperCase().match(/[A-Z]/g) || []);
+        set.add(opt.letter);
+        setNativeValue(hid, Array.from(set).sort().join(''));
+      });
+    } catch (e) {}
+    await tick();
     return optionSelected(opt);
   }
 
@@ -1621,6 +1681,32 @@
     });
   }
 
+  // 多选题补选：只补点、不再请求模型。返回 true 表示本轮处理过，主循环应重新扫描。
+  async function retryPendingMulti(questions) {
+    const pend = [];
+    for (const q of questions) {
+      const p = pendingMulti(q);
+      if (p) pend.push({ q, plan: p.plan, missing: p.missing });
+    }
+    if (!pend.length) return false;
+
+    for (const item of pend) {
+      if (!running) return false;
+      const q = item.q, plan = item.plan, missing = item.missing;
+      log(`第 ${q.index} 题（多选）还差 ${missing.join('、')} 没选上，第 ${plan.tries + 1} 次补选…`, 'warn');
+      try { q.box.scrollIntoView({ block: 'center' }); } catch (e) {}
+      await sleep(200);
+      const targets = q.options.filter(o => plan.letters.indexOf(o.letter) > -1 && missing.indexOf(o.letter) > -1);
+      for (const opt of targets) await clickOption(opt, true);
+      plan.tries++;
+      const still = plan.letters.filter(L => selectedLetters(q).indexOf(L) < 0);
+      if (still.length) log(`第 ${q.index} 题补选后仍差 ${still.join('、')}（已试 ${plan.tries} 次）`, 'warn');
+      else log(`第 ${q.index} 题多选题已选全：${plan.letters.join('、')}`, 'ok');
+    }
+    await sleep(600);
+    return true;
+  }
+
   async function mainLoop() {
     let noNextRetries = 0;   // 连续“找不到可用下一节”的轮数
     let guard = 0;           // 安全阀，防止死循环
@@ -1634,6 +1720,10 @@
       await handlePopups(docs, { wait: false });
 
       const questions = collectQuestions(docs);
+
+      // 多选题补选：模型给的答案里还有没真正选上的选项，直接补点，不再花一次 API 请求
+      if (await retryPendingMulti(questions)) continue;
+
       const unanswered = questions.filter(q => !q.answered);
 
       if (unanswered.length) {
@@ -1773,6 +1863,32 @@
     log(copyText(report) ? '报告已复制到剪贴板，可直接粘贴给我' : '复制失败，请按 F12 在控制台查看', 'ok');
   }
 
+  // 🔬 导出题目 HTML：多选还是搞不定时，把真实结构复制出来发给助手
+  function dumpQuestionDOM() {
+    const docs = getAllDocs();
+    const qs = collectQuestions(docs);
+    const P = [];
+    P.push(`时间 ${new Date().toLocaleString()}｜文档数 ${docs.length}｜题目数 ${qs.length}`);
+    if (!qs.length) P.push('（当前页面没有扫到题目）');
+    qs.slice(0, 3).forEach(q => {
+      P.push(`\n===== 第 ${q.index} 题｜type="${q.type}"｜isMulti=${!!q.isMulti}｜选项数=${q.options.length} =====`);
+      P.push('题干：' + (q.title || '').slice(0, 150));
+      q.options.forEach(o => {
+        const sel = o.checked || optionSelected(o);
+        P.push(`  ${o.letter}｜已选中=${sel}｜input=${o.input ? o.input.type + '(checked=' + o.input.checked + ')' : '无'}`
+          + `｜li.class="${(o.li && typeof o.li.className === 'string') ? o.li.className : ''}"`);
+      });
+      let html = '';
+      try { html = q.box.outerHTML || ''; } catch (e) {}
+      P.push('--- 题块 HTML（截断 4000 字）---');
+      P.push(html.slice(0, 4000));
+    });
+    const report = P.join('\n');
+    console.log('[DS答题-题目HTML]\n' + report);
+    log(`已导出 ${Math.min(qs.length, 3)} 道题的 HTML（${report.length} 字）`);
+    log(copyText(report) ? '已复制到剪贴板，直接粘贴给助手即可' : '复制失败，请按 F12 在控制台找 [DS答题-题目HTML]', 'ok');
+  }
+
   // 🎯 手动拾取（支持 iframe 内）：mode = 'next' 绑「下一节」，mode = 'tab' 绑「章节测验」标签
   let picking = false;
   let pickMode = 'next';
@@ -1850,6 +1966,7 @@
     running = true;
     sections = 0;
     resetVisitedTabs();
+    multiPlan.clear();
     ui.start.style.display = 'none';
     ui.stop.style.display = 'block';
     log(`任务启动，模型：${CONFIG.MODEL}（加密题截图识别固定使用 deepseek-flash）`, 'ok');
@@ -1879,7 +1996,8 @@
       taskSignature, scanReport, cssPath, elDesc, docDesc, isInCatalog, isInLeftRail, resetBadNext,
       clickNextWithRetry, setRunning: v => { running = !!v; },
       collectTaskTabs, extractLetters, resetVisitedTabs, visitedTabs: () => visitedTabs,
-      collectQuestions, clickOption, optionSelected, MULTI_RE
+      collectQuestions, clickOption, optionSelected, MULTI_RE,
+      selectedLetters, pendingMulti, retryPendingMulti, multiPlan, qKeyOf
     };
   } catch (e) {}
 
