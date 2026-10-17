@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.8.4
-// @description  学习通(超星)自动答题。v3.8.4 修手动拾取失效后点错位置：拾取存的是带 :nth-of-type 的位置路径，任务点标签从 2 个变成 3 个后旧路径指向了「2 视频」，脚本就去点了章节测验前面那个位置；现在手动拾取会校验文字，文字不对自动忽略并退回自动识别。同时把每页判定顺序做成显式决策日志：有未完成任务点标签 → 先点它；没有 → 找「下一节」；都没有 → 判定课程结束。
+// @version      3.8.5
+// @description  学习通(超星)自动答题。v3.8.5 修提交：学习通是「两级提交」（先点左下角「提交」，右上角才会出现真正的「提交/交卷」），旧逻辑只点一次就以为提交完成，结果点「下一节」被"本节任务点未完成"拦下还误判课程结束。现在提交改为多轮直到没有未点的提交按钮，并能识别"任务点未完成"提示、回去重新提交。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -2279,14 +2279,18 @@
   }
 
   /* ------------------------- 提交 / 弹窗 / 下一节 ------------------------- */
-  function findClickable(docs, texts, extraSel) {
+  function findClickable(docs, texts, extraSel, skipSet) {
     const candidates = [];
+    const seen = new Set();
     docs.forEach(doc => {
       let els = Array.from(doc.querySelectorAll(
         'button,a,[role=button],input[type=button],input[type=submit],li,div,span,p,.btn'
       ));
       if (extraSel) els = els.concat(Array.from(doc.querySelectorAll(extraSel)));
       els.forEach(el => {
+        if (!el || seen.has(el)) return;
+        seen.add(el);
+        if (skipSet && skipSet.has(el)) return;
         if (!isVisible(el)) return;
         if (isOwnUI(el)) return;
         const t = cleanText(el.textContent || el.value || '');
@@ -2298,6 +2302,30 @@
     // 优先叶子元素（避免点到外层大容器）
     candidates.sort((a, b) => (a.el.textContent.length - b.el.textContent.length));
     return candidates[0] || null;
+  }
+
+  // 学习通"本节含有任务点未完成"这类拦截提示：出现说明【提交没成功】
+  const UNFINISHED_RE = /任务点未完成|任务点未完成|还有.*未完成|未完成.*任务点|请先完成|未提交|还有题目/;
+  async function handleUnfinishedBlock() {
+    const docs = getAllDocs();
+    for (const doc of docs) {
+      let pops = [];
+      try { pops = Array.from(doc.querySelectorAll(POPUP_SEL)).filter(isVisible); } catch (e) { continue; }
+      for (const pop of pops) {
+        const txt = cleanText(pop.textContent || '');
+        if (!txt || !UNFINISHED_RE.test(txt)) continue;
+        log(`页面提示「${txt.slice(0, 40)}」→ 说明答题/提交还没真正完成`, 'err');
+        const btns = Array.from(pop.querySelectorAll('button,a,[role=button],.btn,span,input[type=button]')).filter(isVisible);
+        const ok = btns.find(b => {
+          const t = cleanText(b.textContent || b.value || '');
+          return t && t.length <= 6 && (/确定|知道了|关闭|OK/i.test(t)) && !CONFIG.CANCEL_TEXT.some(c => t.includes(c));
+        });
+        if (ok) { try { nativeClick(ok); } catch (e) {} }
+        await sleep(600);
+        return true;
+      }
+    }
+    return false;
   }
 
   // 判断元素是否被禁用/置灰
@@ -2512,33 +2540,48 @@
     return true;
   }
 
+  // 提交流程：学习通是「两级提交」——
+  //   先点页面左下角的「提交」，才会在右上角出现第二个「提交/交卷」，那个才是真正提交。
+  // 所以这里改成多轮：每轮先处理确认弹窗，再找【还没点过】的提交按钮点掉，
+  // 直到页面上找不到新的提交按钮为止（最多 4 轮）。
   async function autoSubmit(docs) {
     if (!CONFIG.AUTO_SUBMIT) return false;
-    // 先看是否已有确认弹窗（提交按钮可能已经点过）
-    if (await handlePopups(docs, { wait: false })) {
-      log('提交流程已完成', 'ok');
-      return true;
+    const clicked = new WeakSet();
+    let acted = false;
+    for (let round = 0; round < 4; round++) {
+      if (!running) break;
+      // 1) 先处理已经出现的确认/结果弹窗
+      if (await handlePopups(getAllDocs(), { wait: true })) {
+        acted = true;
+        await sleep(1000);
+        continue;
+      }
+      // 2) 找下一个「还没点过」的提交按钮
+      const btn = findClickable(getAllDocs(), CONFIG.SUBMIT_TEXT,
+        '#submitData,.submitBtn,.tj_btn,.Btn_blue_3,[class*="submit"]', clicked);
+      if (!btn) break;
+      clicked.add(btn.el);
+      log(`找到「${btn.t}」按钮，准备提交…${round ? '（第 ' + (round + 1) + ' 级提交）' : ''}`, 'warn');
+      try { btn.el.scrollIntoView({ block: 'center' }); } catch (e) {}
+      await sleep(400);
+      nativeClick(btn.el);
+      acted = true;
+      await sleep(1600);
     }
-    // 找提交按钮
-    const btn = findClickable(docs, CONFIG.SUBMIT_TEXT,
-      '#submitData,.submitBtn,.tj_btn,.Btn_blue_3,[class*="submit"]');
-    if (!btn) return false;
-    log(`找到「${btn.t}」按钮，准备提交…`, 'warn');
-    try { btn.el.scrollIntoView({ block: 'center' }); } catch (e) {}
-    await sleep(500);
-    nativeClick(btn.el);
-    // 多轮等待并处理“是否确认提交”弹窗（可能连续两级确认）
+    // 3) 收尾：再扫一遍弹窗；若仍提示"任务点未完成"则说明没提交成功
     await handlePopups(getAllDocs(), { wait: true });
-    await sleep(1500);
-    // 再补一轮，防止第二级确认/成绩弹窗延迟出现
-    await handlePopups(getAllDocs(), { wait: true });
-    log('提交流程已完成', 'ok');
-    return true;
+    if (await handleUnfinishedBlock()) {
+      log('提交未成功：页面提示任务点未完成，下一轮会重新提交', 'err');
+      return false;
+    }
+    if (acted) log('提交流程已完成', 'ok');
+    return acted;
   }
 
   // 本页只提交一次。用「页面级」标记而不是题目签名：
   // 提交后页面会重渲染，题干文本可能变，用签名去重会失效（实测重复提交了两次）。
   let pageSubmitted = false;
+  let lastNextBlocked = false;   // 点「下一节」被"任务点未完成"拦下
   async function submitOnce(docs, questions) {
     if (pageSubmitted) { log('本页已提交过，跳过重复提交'); return; }
     if (await autoSubmit(docs)) pageSubmitted = true;
@@ -2811,6 +2854,13 @@
         await sleep(600);
         return true;
       }
+      // 被"本节任务点未完成"拦下：不是这个按钮的问题，是答题还没真正提交
+      if (await handleUnfinishedBlock()) {
+        log(`点「${c.t}」被拦下（本节任务点未完成）→ 说明答题还没真正提交，回去重新提交`, 'err');
+        lastNextBlocked = true;
+        clearHighlight();
+        return false;
+      }
       badNextEls.add(c.el);
       log(`点击「${c.t}」后任务点内容没变化，拉黑该元素并换下一个候选`, 'warn');
       await handlePopups(getAllDocs(), { wait: false });
@@ -2939,6 +2989,15 @@
           resetVisitedTabs();          // 换小节了，任务点标签重新计数
           pageSubmitted = false;       // 换小节了，允许重新提交
           if (sections > CONFIG.MAX_SECTIONS) { log('达到最大节数限制，停止', 'warn'); break; }
+        } else if (lastNextBlocked) {
+          // 被"任务点未完成"拦下 → 重新走提交流程，而不是继续点下一节
+          lastNextBlocked = false;
+          noNextRetries = 0;
+          pageSubmitted = false;
+          log('提交未成功导致「下一节」被拦，重新走一遍提交流程…', 'warn');
+          await submitOnce(getAllDocs(), questions);
+          await sleep(1200);
+          continue;
         } else {
           noNextRetries++;
           if (noNextRetries >= CONFIG.NO_NEXT_RETRIES) {
@@ -3175,7 +3234,8 @@
       bankQueryText, queryFreeBank, queryFreeBank2, isBankGarbage, BANK_AD_RE, refreshQuestion, recentClicks, questionReport,
       getPageFn, hiddenAnswerLetters, nativeClick,
       decodeFontObfuscation, ensureTypr, ensureMd5, ensureFontTable, buildFontMap, submitOnce,
-      transcribeEncrypted, glmTranscribeRequest, parseTranscription, glyphInTable, glyphForCode, parseCmapFromBuffer
+      transcribeEncrypted, glmTranscribeRequest, parseTranscription, glyphInTable, glyphForCode, parseCmapFromBuffer,
+      findClickable, handleUnfinishedBlock, autoSubmit, UNFINISHED_RE
     };
   } catch (e) {}
 

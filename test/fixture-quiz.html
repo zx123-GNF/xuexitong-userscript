@@ -393,6 +393,32 @@
         ok('parseCmapFromBuffer 记录了平台/编码（p3e10）',
           !!(tabs && tabs[0].platformID === 3 && tabs[0].encodingID === 10));
       })();
+
+      // ---------- P. 两级提交：先点左下角「提交」，再点右上角「提交」 ----------
+      (function () {
+        const subL = document.createElement('button');
+        subL.id = 'subL'; subL.textContent = '提交';
+        subL.style.cssText = 'position:fixed;left:10px;bottom:10px;width:60px;height:30px;';
+        const subR = document.createElement('button');
+        subR.id = 'subR'; subR.textContent = '提交';
+        subR.style.cssText = 'position:fixed;right:10px;top:10px;width:60px;height:30px;display:none;';
+        document.body.appendChild(subL); document.body.appendChild(subR);
+
+        const pick1 = dbg.findClickable(dbg.getAllDocs(), ['提交'], 'button', new WeakSet());
+        ok('findClickable 能找到第一个「提交」（左下角）', !!(pick1 && pick1.el.id === 'subL'), pick1 && pick1.el.id);
+
+        const skip = new WeakSet(); skip.add(subL);
+        subR.style.display = 'block';
+        const pick2 = dbg.findClickable(dbg.getAllDocs(), ['提交'], 'button', skip);
+        ok('跳过已点的提交后能找到第二个「提交」（右上角）', !!(pick2 && pick2.el.id === 'subR'), pick2 && pick2.el.id);
+
+        ok('能识别「本节任务点未完成」这类拦截提示',
+          dbg.UNFINISHED_RE.test('本节含有任务点未完成，请先完成后再提交') === true
+          && dbg.UNFINISHED_RE.test('还有题目未提交') === true
+          && dbg.UNFINISHED_RE.test('提交成功') === false);
+
+        subL.remove(); subR.remove();
+      })();
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }
