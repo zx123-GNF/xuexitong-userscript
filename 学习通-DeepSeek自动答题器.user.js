@@ -1,15 +1,21 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.2.0
-// @description  学习通(超星)章节/作业/测验页面：填入自己的 DeepSeek API Key，点击启动后自动识别题目并调用 DeepSeek 作答（字体加密题自动截图走视觉识别），自动提交、自动下一节。v3.0.0 修复误点左侧目录；v3.1.0 优先点开「章节测验」任务点；v3.2.0 重写选项点击逻辑（避免多选被双重触发抵消、隐藏答案框改为并集累加），并加入“多选没选全就继续补选”的闭环。
+// @version      3.3.0
+// @description  学习通(超星)章节/作业/测验页面：自动答题。v3.3.0 新增题库优先策略：先查本地题库 → 自定义题库 → 免费公开题库（网课小助手 cx.icodef.com，免 token），命中直接搬答案，查不到才调 DeepSeek 兜底，并把结果自动回写本地题库。v3.0.0 修复误点左侧目录；v3.1.0 优先进入「章节测验」任务点；v3.2.0 重写选项点击逻辑修复多选。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
 // @match        *://*.chaoxing.com.cn/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @connect      api.deepseek.com
+// @connect      cx.icodef.com
+// @connect      api.tikuhai.com
+// @connect      tk.enncy.cn
+// @connect      api.muketool.com
 // @connect      cdn.staticfile.org
 // @connect      cdn.bootcdn.net
 // @connect      cdnjs.cloudflare.com
@@ -43,6 +49,23 @@
     MODEL_VISION: 'deepseek-flash', // 视觉模型：deepseek-flash 原生支持图片（字体加密题截图识别）
     VISION_BATCH: 5,                // 视觉请求每批最多几张题块图
     TEMPERATURE: 0.1,
+    // ==================== 题库（v3.3.0）====================
+    // 检索顺序：本地题库 → 自定义题库 → 免费公开题库 → DeepSeek 兜底
+    BANK_ENABLED: true,             // 总开关：先用题库，查不到再用 AI
+    BANK_FREE_ENABLED: true,        // 免费公开题库（网课小助手 cx.icodef.com，免 token）
+    BANK_FREE_URLS: [
+      'https://cx.icodef.com/wyn-nb?v=4',
+      'http://cx.icodef.com/wyn-nb?v=4'
+    ],
+    // 该免费接口有「1 并发」限制，必须严格串行 + 留间隔，否则立刻返回流控
+    BANK_MIN_INTERVAL: 4000,
+    BANK_TIMEOUT: 12000,
+    BANK_RATE_BACKOFF: 10000,       // 被流控后的冷却时间(ms)
+    BANK_MAX_PER_ROUND: 24,         // 每轮最多查多少题，防止一节课题太多卡太久
+    LOCAL_BANK: true,               // 本地题库（自动收录 + 命中，跨学习通子域共享）
+    LOCAL_BANK_MAX: 5000,
+    BANK_CUSTOM_URL: '',            // 自定义题库地址（兼容 POST /api/search 协议）
+    BANK_CUSTOM_KEY: '',            // 自定义题库密钥
     // html2canvas 截图库 CDN（按顺序尝试，国内优先）
     H2C_URLS: [
       'https://cdn.staticfile.org/html2canvas/1.4.1/html2canvas.min.js',
@@ -139,6 +162,11 @@
       if (typeof s.subjective === 'boolean') CONFIG.ENABLE_SUBJECTIVE = s.subjective;
       if (typeof s.nextPick === 'string') CONFIG.NEXT_BTN_PICKED = s.nextPick;
       if (typeof s.tabPick === 'string') CONFIG.TASK_TAB_PICKED = s.tabPick;
+      if (typeof s.bank === 'boolean') CONFIG.BANK_ENABLED = s.bank;
+      if (typeof s.bankFree === 'boolean') CONFIG.BANK_FREE_ENABLED = s.bankFree;
+      if (typeof s.localBank === 'boolean') CONFIG.LOCAL_BANK = s.localBank;
+      if (typeof s.bankUrl === 'string') CONFIG.BANK_CUSTOM_URL = s.bankUrl;
+      if (typeof s.bankKey === 'string') CONFIG.BANK_CUSTOM_KEY = s.bankKey;
     } catch (e) {}
   }
   function saveSettings(patch) {
@@ -166,7 +194,7 @@
         padding:8px 12px;background:#243049;cursor:move;font-weight:600}
       #glm-panel .hd b{font-size:13px}
       #glm-panel .hd span{cursor:pointer;padding:0 4px;opacity:.7}
-      #glm-panel .bd{padding:10px 12px}
+      #glm-panel .bd{padding:10px 12px;max-height:calc(100vh - 130px);overflow-y:auto}
       #glm-panel .row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
       #glm-panel button{border:0;border-radius:6px;padding:6px 14px;cursor:pointer;
         font-size:13px;font-weight:600;color:#fff}
@@ -228,6 +256,22 @@
           <button id="glm-pickclear" style="background:#555f70;flex:1">清除所有手动拾取</button>
         </div>
         <div class="row"><div id="glm-pickinfo" style="font-size:11px;opacity:.75;line-height:1.45">自动识别中</div></div>
+        <div class="row" style="flex-wrap:wrap;gap:4px 10px">
+          <label><input type="checkbox" id="glm-bank" ${CONFIG.BANK_ENABLED ? 'checked' : ''}> 题库优先</label>
+          <label><input type="checkbox" id="glm-bankfree" ${CONFIG.BANK_FREE_ENABLED ? 'checked' : ''}> 免费题库</label>
+          <label><input type="checkbox" id="glm-banklocal" ${CONFIG.LOCAL_BANK ? 'checked' : ''}> 本地库</label>
+        </div>
+        <div class="row">
+          <input type="text" id="glm-bankurl" placeholder="自定义题库地址（可留空）" value="${CONFIG.BANK_CUSTOM_URL || ''}">
+          <button class="save" id="glm-banksave">保存</button>
+        </div>
+        <div class="row"><div id="glm-bankstat" style="font-size:11px;opacity:.75;line-height:1.45">本地题库 0 题</div></div>
+        <div class="row">
+          <button id="glm-banktest" style="background:#2f7f6f;flex:1">🔌 测试题库</button>
+          <button id="glm-bankexport" style="background:#3f6fb5;flex:0 0 46px;padding:6px 6px">导出</button>
+          <button id="glm-bankimport" style="background:#3f6fb5;flex:0 0 46px;padding:6px 6px">导入</button>
+          <button id="glm-bankclear" style="background:#8a3b3b;flex:0 0 46px;padding:6px 6px">清空</button>
+        </div>
         <div class="log" id="glm-log"></div>
       </div>`;
     document.body.appendChild(panel);
@@ -285,6 +329,46 @@
     ui.pickBtn = panel.querySelector('#glm-pick');
     ui.pickTabBtn = panel.querySelector('#glm-picktab');
     refreshPickInfo();
+
+    // ---- 题库 ----
+    ui.bankStat = panel.querySelector('#glm-bankstat');
+    panel.querySelector('#glm-bank').onchange = e => { CONFIG.BANK_ENABLED = e.target.checked; saveSettings({ bank: e.target.checked }); };
+    panel.querySelector('#glm-bankfree').onchange = e => { CONFIG.BANK_FREE_ENABLED = e.target.checked; saveSettings({ bankFree: e.target.checked }); };
+    panel.querySelector('#glm-banklocal').onchange = e => { CONFIG.LOCAL_BANK = e.target.checked; saveSettings({ localBank: e.target.checked }); };
+    panel.querySelector('#glm-banksave').onclick = () => {
+      const v = panel.querySelector('#glm-bankurl').value.trim();
+      CONFIG.BANK_CUSTOM_URL = v;
+      saveSettings({ bankUrl: v });
+      refreshBankStat();
+      log(v ? '自定义题库地址已保存' : '自定义题库地址已清空', 'ok');
+    };
+    panel.querySelector('#glm-banktest').onclick = () => testBank();
+    panel.querySelector('#glm-bankexport').onclick = () => {
+      const json = JSON.stringify(loadLocalBank());
+      if (copyText(json)) log(`本地题库已导出到剪贴板（${localBankSize()} 题）`, 'ok');
+      else log('导出失败，请按 F12 在控制台查看 [DS答题] 日志', 'err');
+    };
+    panel.querySelector('#glm-bankimport').onclick = () => {
+      const txt = prompt('粘贴之前导出的题库 JSON：');
+      if (!txt) return;
+      try {
+        const o = JSON.parse(txt);
+        if (!o || typeof o !== 'object') throw new Error('格式不对');
+        const bank = loadLocalBank();
+        let n = 0;
+        Object.keys(o).forEach(k => { if (o[k] && o[k].a) { bank[k] = o[k]; n++; } });
+        saveLocalBank(bank);
+        refreshBankStat();
+        log(`已导入 ${n} 题，本地题库共 ${localBankSize()} 题`, 'ok');
+      } catch (e) { log('导入失败：' + e.message, 'err'); }
+    };
+    panel.querySelector('#glm-bankclear').onclick = () => {
+      if (!confirm('确定清空本地题库？此操作不可撤销。')) return;
+      saveLocalBank({});
+      refreshBankStat();
+      log('本地题库已清空', 'warn');
+    };
+    refreshBankStat();
     panel.querySelector('#glm-min').onclick = () => panel.classList.toggle('collapsed');
     makeDraggable(panel, panel.querySelector('.hd'));
   }
@@ -303,6 +387,34 @@
     ui.pickInfo.textContent =
       '下一节：' + (CONFIG.NEXT_BTN_PICKED ? '已手动绑定' : '自动识别') +
       ' ｜ 章节测验：' + (CONFIG.TASK_TAB_PICKED ? '已手动绑定' : '自动识别');
+  }
+
+  function refreshBankStat() {
+    if (!ui.bankStat) return;
+    try {
+      ui.bankStat.textContent = '本地题库 ' + localBankSize() + ' 题'
+        + (CONFIG.BANK_CUSTOM_URL ? '｜自定义接口已配置' : '')
+        + (CONFIG.BANK_FREE_ENABLED ? '｜免费题库开' : '｜免费题库关');
+    } catch (e) {}
+  }
+
+  // 🔌 题库连通性测试（免费题库有 1 并发限制，这里只发一条）
+  async function testBank() {
+    if (!CONFIG.BANK_FREE_ENABLED && !CONFIG.BANK_CUSTOM_URL) {
+      log('免费题库和自定义题库都没开，先勾选或填地址', 'warn');
+      return;
+    }
+    log('测试题库连通性…（免费题库有 1 并发限制）', 'warn');
+    const t0 = Date.now();
+    if (CONFIG.BANK_CUSTOM_URL) {
+      const r = await queryCustomBank({ title: '马克思主义哲学的直接理论来源是', type: '单选题', options: [] });
+      log(r ? '自定义题库可用：' + r.answer.slice(0, 50) : '自定义题库没返回可用答案', r ? 'ok' : 'err');
+    }
+    if (CONFIG.BANK_FREE_ENABLED) {
+      const r = await queryFreeBank('马克思主义哲学的直接理论来源是');
+      if (r && r.answer) log(`免费题库可用（${r.src}）：${r.answer.slice(0, 50)}（${Date.now() - t0}ms）`, 'ok');
+      else log('免费题库没返回答案：可能未收录 / 流控 / 网络不通，稍后再试', 'err');
+    }
   }
 
   function makeDraggable(el, handle) {
@@ -739,6 +851,227 @@
     return Array.from(new Set(firsts));
   }
 
+  /* ==================== 题库检索（v3.3.0） ====================
+   * 检索顺序：本地题库 → 自定义题库 → 免费公开题库 → AI 兜底。
+   *
+   * 免费公开题库用的是社区脚本「超星学习通满分助手」同款接口：
+   *   POST https://cx.icodef.com/wyn-nb?v=4    {"question":"题干"}
+   *   → {"code":1,"data":"答案1#答案2"}        code:-1 未收录   code:-2 触发流控
+   * 实测：免 token、命中率约 5/6，但【只允许 1 并发】，必须严格串行并留间隔，
+   * 否则立刻返回 -2 流控。所以这里做了串行队列 + 最小间隔 + 流控冷却。
+   *
+   * 说明：这是第三方公开接口，不是官方题库；可能失效、可能不准确，
+   * 面板上可以一键关掉，关掉后就走原来的 AI 答题流程。
+   */
+  const BANK_STORE = 'ds-bank-v1';
+  let bankLastCall = 0;         // 上一次免费题库请求时间
+  let bankCooldownUntil = 0;    // 流控冷却截止时间
+
+  // GM 存储优先（跨 mooc1/mooc2 等学习通子域共享），没有授权就退回 localStorage
+  function storeGet(k, dflt) {
+    try {
+      if (typeof GM_getValue === 'function') {
+        const v = GM_getValue(k);
+        return (v === undefined || v === null || v === '') ? dflt : v;
+      }
+      const v = localStorage.getItem(k);
+      return v === null ? dflt : v;
+    } catch (e) { return dflt; }
+  }
+  function storeSet(k, v) {
+    try {
+      if (typeof GM_setValue === 'function') { GM_setValue(k, v); return true; }
+      localStorage.setItem(k, v); return true;
+    } catch (e) {
+      try { log('题库写入失败（存储空间可能已满）', 'err'); } catch (e2) {}
+      return false;
+    }
+  }
+
+  // 通用 HTTP 请求（GM_xmlhttpRequest → Promise；没授权时退回 fetch）
+  function gmRequest(opts) {
+    return new Promise((resolve, reject) => {
+      const method = opts.method || 'GET';
+      const headers = opts.headers || {};
+      if (typeof GM_xmlhttpRequest === 'function') {
+        try {
+          GM_xmlhttpRequest({
+            method, url: opts.url, headers, data: opts.data,
+            timeout: opts.timeout || 15000,
+            onload: res => resolve(res),
+            ontimeout: () => reject(new Error('请求超时')),
+            onerror: () => reject(new Error('网络错误'))
+          });
+          return;
+        } catch (e) {}
+      }
+      fetch(opts.url, { method, headers, body: opts.data })
+        .then(r => r.text().then(t => resolve({ status: r.status, responseText: t })))
+        .catch(reject);
+    });
+  }
+
+  // 题干归一化：全角转半角、去掉题号/题型标记，然后只保留中文/字母/数字
+  function normQuestion(s) {
+    return String(s || '')
+      .replace(/[\uFF01-\uFF5E]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+      .replace(/[（(【\[]\s*(单项选择题|多项选择题|不定项选择题|单选题|多选题|判断题|填空题?|简答题?)\s*[）)】\]]/g, '')
+      .replace(/^\s*\d+\s*[、.．]\s*/, '')
+      .replace(/[^\u4e00-\u9fa5A-Za-z0-9]/g, '')
+      .toLowerCase();
+  }
+  function bankKey(q) { return normQuestion(q.title).slice(0, 200); }
+
+  // 题库答案文本 → 数组："A#B#C" / "正确" / "黑格尔的辩证法#费尔巴哈的唯物论"
+  function bankAnswerToArray(raw) {
+    return String(raw == null ? '' : raw)
+      .split(/[#｜|]+/)
+      .map(s => s.replace(/<[^>]*>/g, '').trim())
+      .filter(Boolean);
+  }
+
+  // 去掉选项行前面的字母标记（"A黑格尔的辩证法" → "黑格尔的辩证法"）
+  function stripOptionLetter(t) {
+    const s = cleanText(String(t || ''));
+    const r = s.replace(/^[A-Za-z][\s.、．:：)）]*/, '').trim();
+    return r || s;
+  }
+
+  // ---------- 本地题库 ----------
+  function loadLocalBank() {
+    try {
+      const raw = storeGet(BANK_STORE, '{}');
+      const o = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      return (o && typeof o === 'object') ? o : {};
+    } catch (e) { return {}; }
+  }
+  function saveLocalBank(bank) { return storeSet(BANK_STORE, JSON.stringify(bank)); }
+  function localBankSize() { return Object.keys(loadLocalBank()).length; }
+
+  // 收录一道题：存「选项文本」而不是字母，这样即使选项顺序变了也能对上
+  function rememberQuestion(q, answer) {
+    try {
+      const ans = String(answer || '').trim();
+      if (!ans || ans.length > 400) return;
+      const key = bankKey(q);
+      if (!key || key.length < 6) return;
+      const bank = loadLocalBank();
+      if (bank[key] && bank[key].a === ans) return;
+      bank[key] = { q: (q.title || '').slice(0, 120), a: ans, t: q.type || '', ts: Date.now() };
+      const keys = Object.keys(bank);
+      if (keys.length > CONFIG.LOCAL_BANK_MAX) {
+        keys.sort((a, b) => (bank[a].ts || 0) - (bank[b].ts || 0));
+        keys.slice(0, keys.length - CONFIG.LOCAL_BANK_MAX).forEach(k => delete bank[k]);
+      }
+      saveLocalBank(bank);
+    } catch (e) {}
+  }
+
+  // 题型 → chaoxing-toolkit 协议的数字编号（0单选 1多选 2填空 3判断 4简答 5名词解释 6论述 7计算）
+  function typeToInt(t) {
+    const s = String(t || '');
+    if (/多选|多项|不定项/.test(s)) return 1;
+    if (/填空/.test(s)) return 2;
+    if (/判断|是非/.test(s)) return 3;
+    if (/名词解释/.test(s)) return 5;
+    if (/论述/.test(s)) return 6;
+    if (/计算/.test(s)) return 7;
+    if (/简答|问答|分析/.test(s)) return 4;
+    return 0;
+  }
+
+  // ---------- 自定义题库（兼容 chaoxing-toolkit：POST /api/search） ----------
+  async function queryCustomBank(q) {
+    if (!CONFIG.BANK_CUSTOM_URL) return null;
+    try {
+      const r = await gmRequest({
+        method: 'POST', url: CONFIG.BANK_CUSTOM_URL, timeout: CONFIG.BANK_TIMEOUT,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ question: q.title, type: typeToInt(q.type), key: CONFIG.BANK_CUSTOM_KEY })
+      });
+      const j = JSON.parse(r.responseText);
+      const ans = (j && j.data && (j.data.answer || j.data.ans)) || (j && (j.answer || j.ans)) || '';
+      return ans ? { answer: String(ans), src: '自定义题库' } : null;
+    } catch (e) { return null; }
+  }
+
+  // ---------- 免费公开题库：网课小助手（1 并发限制，必须串行 + 限速） ----------
+  async function queryFreeBank(question) {
+    if (!CONFIG.BANK_FREE_ENABLED) return null;
+    const now = Date.now();
+    if (now < bankCooldownUntil) return null;
+    const wait = bankLastCall + CONFIG.BANK_MIN_INTERVAL - now;
+    if (wait > 0) await sleep(wait);
+
+    for (const url of CONFIG.BANK_FREE_URLS) {
+      if (!running) return null;
+      bankLastCall = Date.now();
+      try {
+        const r = await gmRequest({
+          method: 'POST', url, timeout: CONFIG.BANK_TIMEOUT,
+          headers: { 'Content-Type': 'application/json', Referer: location.href },
+          data: JSON.stringify({ question })
+        });
+        const j = JSON.parse(r.responseText);
+        if (j.code === 1 && j.data) return { answer: String(j.data), src: '网课小助手' };
+        if (j.code === -2) {
+          bankCooldownUntil = Date.now() + CONFIG.BANK_RATE_BACKOFF;
+          log(`题库触发流控，冷却 ${Math.round(CONFIG.BANK_RATE_BACKOFF / 1000)}s 后再试`, 'warn');
+          return null;
+        }
+        if (j.code === -1) return null;      // 未收录
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  // ---------- 统一检索入口 ----------
+  async function bankLookup(questions) {
+    const found = new Map();     // q.index → { answer, src }
+    if (!CONFIG.BANK_ENABLED) return found;
+
+    // ① 本地题库（零延迟）
+    const bank = CONFIG.LOCAL_BANK ? loadLocalBank() : {};
+    const miss = [];
+    for (const q of questions) {
+      const hit = bank[bankKey(q)];
+      if (hit && hit.a) found.set(q.index, { answer: hit.a, src: '本地题库' });
+      else miss.push(q);
+    }
+    if (!miss.length) return found;
+
+    // ② 自定义题库
+    const still = [];
+    for (const q of miss) {
+      if (!running) return found;
+      const r = CONFIG.BANK_CUSTOM_URL ? await queryCustomBank(q) : null;
+      if (r) found.set(q.index, r); else still.push(q);
+    }
+    if (!still.length) return found;
+
+    // ③ 免费公开题库（严格串行 + 限速）
+    let n = 0;
+    const cap = Math.min(still.length, CONFIG.BANK_MAX_PER_ROUND);
+    for (const q of still) {
+      if (!running) break;
+      if (n >= cap) {
+        log(`本轮免费题库查询已达上限 ${cap} 题，其余直接交给 AI`, 'warn');
+        break;
+      }
+      if (Date.now() < bankCooldownUntil) { log('题库冷却中，其余题目直接交给 AI', 'warn'); break; }
+      n++;
+      setStatus(`题库检索 ${n}/${cap}…`);
+      const r = await queryFreeBank(q.title);
+      if (r && r.answer) {
+        found.set(q.index, r);
+        log(`第 ${q.index} 题 题库命中（${r.src}）：${r.answer.slice(0, 45)}`, 'ok');
+      } else {
+        log(`第 ${q.index} 题 题库未收录，交给 AI`);
+      }
+    }
+    return found;
+  }
+
   /* ---------------- 多选题答案跟踪（反复补选，直到真的选上） ---------------- */
   // 关键点：多选题只要有一个目标选项没真正选上，主循环就会重试点击，
   // 而不是因为 answered=true 就当它做完了 —— 这正是“多选只选上一个就跑了”的原因。
@@ -756,49 +1089,119 @@
   }
 
   /* ---------------------------- 执行作答 ---------------------------- */
-  async function answerQuestions(questions) {
-    let answers = {};
-    const useVision = questions.some(q => q.encrypted);
+  // 把「答案数组」映射成选项对象。题库答案和 AI 答案共用这一套：
+  //   字母（A / A#B）→ 按字母
+  //   选项文本（黑格尔的辩证法）→ 归一化包含匹配
+  //   判断题（正确/错误/对/错）→ 语义兜底
+  function mapAnswersToOptions(q, ans) {
+    const picked = [];
+    const pushOpt = opt => { if (opt && !picked.includes(opt)) picked.push(opt); };
 
-    try {
-      if (useVision) {
-        // 字体加密题：截图（浏览器按自定义字体正常渲染）→ 视觉模型
-        log('检测到字体加密（font-cxsecret），改为截图交给视觉模型识别…', 'warn');
-        const shots = new Map();
-        for (const q of questions) {
-          try {
-            setStatus(`截图第 ${q.index} 题…`);
-            shots.set(q.index, await shotQuestion(q));
-          } catch (e) {
-            log(`第 ${q.index} 题截图失败：${e.message}`, 'err');
-          }
-        }
-        for (let i = 0; i < questions.length; i += CONFIG.VISION_BATCH) {
-          if (!running) return false;
-          const batch = questions.slice(i, i + CONFIG.VISION_BATCH).filter(q => shots.has(q.index));
-          if (!batch.length) continue;
-          const imgs = batch.map(q => shots.get(q.index));
-          log(`视觉识别第 ${batch[0].index}–${batch[batch.length - 1].index} 题（${imgs.length} 张图）…`);
-          const content = await glmVisionRequest(imgs, batch);
-          log('视觉模型返回：' + content.slice(0, 120).replace(/\n/g, ' '));
-          Object.assign(answers, parseAnswers(content, batch));
-          await sleep(500);
-        }
-      } else {
-        log(`正在请求 DeepSeek（${CONFIG.MODEL}）作答 ${questions.length} 道题…`);
-        const content = await glmRequest(buildPrompt(questions));
-        log('DeepSeek 已返回：' + content.slice(0, 120).replace(/\n/g, ' '));
-        answers = parseAnswers(content, questions);
+    // ① 字母
+    extractLetters(ans).forEach(letter => pushOpt(q.options.find(o => o.letter === letter)));
+
+    // ② 选项文本
+    if (!picked.length) {
+      ans.forEach(a => {
+        const kw = normQuestion(stripOptionLetter(a).replace(/^[A-Za-z][.、．\s]*/, ''));
+        if (!kw) return;
+        q.options.forEach(o => {
+          const no = normQuestion(stripOptionLetter(o.text));
+          if (!no) return;
+          if (no === kw || no.includes(kw) || kw.includes(no)) pushOpt(o);
+        });
+      });
+      // 单选题只可能有一个答案：多个命中时留最长的，避免“人”这种短选项误匹配
+      if (!q.isMulti && picked.length > 1) {
+        picked.sort((a, b) => normQuestion(stripOptionLetter(b.text)).length - normQuestion(stripOptionLetter(a.text)).length);
+        picked.splice(1);
       }
-    } catch (e) {
-      log('模型请求失败：' + e.message, 'err');
-      await sleep(3000);
-      return false;
     }
 
+    // ③ 判断题语义
+    if (!picked.length) {
+      const raw = ans.map(String).join(' ');
+      const wantTrue = /正确|对|是|√|true|\bT\b/i.test(raw);
+      const wantFalse = /错误|错|否|×|false|\bF\b/i.test(raw);
+      const re = wantTrue ? /正确|对|是|√|true|yes/i : (wantFalse ? /错误|错|否|×|false|no/i : null);
+      if (re) pushOpt(q.options.find(o => re.test(cleanText(String(o.text || '')))));
+    }
+    return picked;
+  }
+
+  async function answerQuestions(questions) {
+    const answers = {};
+    const sources = {};
+
+    // ========== 第一段：题库（本地 → 自定义 → 免费公开） ==========
+    try {
+      const hit = await bankLookup(questions);
+      if (hit.size) {
+        const srcs = Array.from(new Set(Array.from(hit.values()).map(v => v.src))).join('、');
+        hit.forEach((v, idx) => {
+          answers[idx] = bankAnswerToArray(v.answer);
+          sources[idx] = v.src;
+          const q = questions.find(x => x.index === idx);
+          // 外部题库命中即时回写本地库，下次免查询
+          if (q && CONFIG.LOCAL_BANK && v.src !== '本地题库') rememberQuestion(q, v.answer);
+        });
+        log(`题库命中 ${hit.size}/${questions.length} 题（${srcs}）`, 'ok');
+      } else if (CONFIG.BANK_ENABLED) {
+        log('题库全部未命中，交给 AI');
+      }
+    } catch (e) {
+      log('题库检索异常：' + e.message, 'warn');
+    }
+    if (!running) return false;
+
+    // ========== 第二段：AI 兜底（只查题库没命中的题） ==========
+    const needAI = questions.filter(q => !answers[q.index] || !answers[q.index].length);
+    let aiFailed = false;
+    if (needAI.length) {
+      log(`AI 兜底作答 ${needAI.length} 题…`);
+      const useVision = needAI.some(q => q.encrypted);
+      try {
+        if (useVision) {
+          // 字体加密题：截图（浏览器按自定义字体正常渲染）→ 视觉模型
+          log('检测到字体加密（font-cxsecret），改为截图交给视觉模型识别…', 'warn');
+          const shots = new Map();
+          for (const q of needAI) {
+            if (!running) return false;
+            try {
+              setStatus(`截图第 ${q.index} 题…`);
+              shots.set(q.index, await shotQuestion(q));
+            } catch (e) {
+              log(`第 ${q.index} 题截图失败：${e.message}`, 'err');
+            }
+          }
+          for (let i = 0; i < needAI.length; i += CONFIG.VISION_BATCH) {
+            if (!running) return false;
+            const batch = needAI.slice(i, i + CONFIG.VISION_BATCH).filter(q => shots.has(q.index));
+            if (!batch.length) continue;
+            const imgs = batch.map(q => shots.get(q.index));
+            log(`视觉识别第 ${batch[0].index}–${batch[batch.length - 1].index} 题（${imgs.length} 张图）…`);
+            const content = await glmVisionRequest(imgs, batch);
+            Object.assign(answers, parseAnswers(content, batch));
+            await sleep(500);
+          }
+        } else {
+          log(`正在请求 DeepSeek（${CONFIG.MODEL}）作答 ${needAI.length} 道题…`);
+          const content = await glmRequest(buildPrompt(needAI));
+          log('DeepSeek 已返回：' + content.slice(0, 120).replace(/\n/g, ' '));
+          Object.assign(answers, parseAnswers(content, needAI));
+        }
+        needAI.forEach(q => { if (answers[q.index] && answers[q.index].length) sources[q.index] = 'AI'; });
+      } catch (e) {
+        aiFailed = true;
+        log('模型请求失败：' + e.message, 'err');
+      }
+    }
+
+    // ========== 第三段：应用答案 ==========
     for (const q of questions) {
       if (!running) return false;
       const ans = answers[q.index];
+      const src = sources[q.index] ? '[' + sources[q.index] + '] ' : '';
       if (!ans || !ans.length) { log(`第 ${q.index} 题未取得答案，跳过`, 'warn'); continue; }
 
       try { q.box.scrollIntoView({ block: 'center' }); } catch (e) {}
@@ -809,34 +1212,15 @@
           const v = (ans[i] ?? ans[0] ?? '').toString().trim();
           if (v) { setNativeValue(inp, v); }
         });
-        log(`第 ${q.index} 题（填空）已填入：${ans.join(' / ').slice(0, 60)}`, 'ok');
+        log(`${src}第 ${q.index} 题（填空）已填入：${ans.join(' / ').slice(0, 60)}`, 'ok');
+        if (CONFIG.LOCAL_BANK) rememberQuestion(q, ans.join('|'));
       } else if (/简答|问答|论述|名词解释|计算|分析/.test(q.type)) {
         const ta = q.textareas[0];
         if (ta) { setNativeValue(ta, ans[0].toString()); log(`第 ${q.index} 题（简答）已填写`, 'ok'); }
+        // 主观题不回写题库：AI 的简答答案不可靠，避免污染题库
       } else {
-        // 选择/判断题：先规范成字母列表 → 逐个点击 → 校验 → 没选上的补点一次
-        const picked = [];
-        const pushOpt = opt => { if (opt && !picked.includes(opt)) picked.push(opt); };
-
-        extractLetters(ans).forEach(letter => pushOpt(q.options.find(o => o.letter === letter)));
-
-        // 字母对不上：按答案文本反查选项
-        if (!picked.length) {
-          ans.forEach(a => {
-            const kw = String(a).replace(/^[A-Za-z][\.、．\s]*/, '').trim();
-            if (!kw) return;
-            pushOpt(q.options.find(o => o.text && (o.text.includes(kw) || kw.includes(o.text.slice(2).trim()))));
-          });
-        }
-        // 判断题兜底：正确/对/√/是 与 错误/错/×/否 直接对选项文本
-        if (!picked.length) {
-          const raw = ans.map(String).join(' ');
-          const wantTrue = /正确|对|是|√|true|\bT\b/i.test(raw);
-          const wantFalse = /错误|错|否|×|false|\bF\b/i.test(raw);
-          const re = wantTrue ? /正确|对|是|√|true/i : (wantFalse ? /错误|错|否|×|false/i : null);
-          if (re) pushOpt(q.options.find(o => re.test(o.text)));
-        }
-
+        // 选择/判断题：字母/文本/判断语义 → 逐个点击 → 校验 → 没选上的补点一次
+        const picked = mapAnswersToOptions(q, ans);
         if (picked.length) {
           const isMulti = q.isMulti || picked.length > 1;
           for (const opt of picked) await clickOption(opt, isMulti);
@@ -848,7 +1232,7 @@
             for (const opt of missing) await clickOption(opt, isMulti);
             missing = picked.filter(o => !optionSelected(o));
           }
-          log(`第 ${q.index} 题（${q.type || (isMulti ? '多选题' : '单选题')}）已选：${picked.map(o => o.letter).join('、')}`
+          log(`${src}第 ${q.index} 题（${q.type || (isMulti ? '多选题' : '单选题')}）已选：${picked.map(o => o.letter).join('、')}`
             + (missing.length ? `｜警告：${missing.map(o => o.letter).join('、')} 仍未选中` : ''),
             missing.length ? 'warn' : 'ok');
           // 记下多选的期望答案：只要没选全，主循环会继续补选
@@ -856,12 +1240,16 @@
           if (isMulti && picked.length < 2) {
             log(`第 ${q.index} 题判定为多选题，但只拿到 1 个答案（${ans.join(',')}），可能漏选，请人工确认`, 'err');
           }
+          // 回写本地题库：存「选项文本」，选项顺序变了也能对上
+          if (CONFIG.LOCAL_BANK) rememberQuestion(q, picked.map(o => stripOptionLetter(o.text)).join('#'));
         } else {
           log(`第 ${q.index} 题答案无法匹配选项：${ans.join(',')}`, 'warn');
         }
       }
       await sleep(450);
     }
+
+    if (aiFailed && !Object.keys(answers).length) { await sleep(3000); return false; }
     return true;
   }
 
@@ -1997,7 +2385,9 @@
       clickNextWithRetry, setRunning: v => { running = !!v; },
       collectTaskTabs, extractLetters, resetVisitedTabs, visitedTabs: () => visitedTabs,
       collectQuestions, clickOption, optionSelected, MULTI_RE,
-      selectedLetters, pendingMulti, retryPendingMulti, multiPlan, qKeyOf
+      selectedLetters, pendingMulti, retryPendingMulti, multiPlan, qKeyOf,
+      normQuestion, bankKey, bankAnswerToArray, mapAnswersToOptions, stripOptionLetter,
+      loadLocalBank, saveLocalBank, localBankSize, rememberQuestion, bankLookup, typeToInt
     };
   } catch (e) {}
 

@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -53,6 +53,15 @@
     <input type="hidden" id="answerQ4" name="answerQ4" value="">
   </div>
 
+  <!-- 题5：判断题（选项文本是“正确/错误”），验证题库返回“正确”时能映射到选项 -->
+  <div class="TiMu" id="q5">
+    <div class="Zy_TItle">5.（判断题）实践是检验真理的唯一标准。（ ）</div>
+    <ul class="nr_ul" id="ul5">
+      <li id="q5A" aria-checked="false" data-letter="A"><span class="num_option" data="A">A</span><span>正确</span></li>
+      <li id="q5B" aria-checked="false" data-letter="B"><span class="num_option" data="B">B</span><span>错误</span></li>
+    </ul>
+  </div>
+
   <div id="RESULT">PENDING</div>
 
   <script src="../学习通-DeepSeek自动答题器.user.js"></script>
@@ -90,7 +99,7 @@
 
       // ---------- B. 题型识别：只写「（多选）」也要认出来 ----------
       const qs = dbg.collectQuestions(dbg.getAllDocs());
-      ok('扫到 3 道题', qs.length === 3, 'qs=' + qs.length);
+      ok('扫到 4 道题', qs.length === 4, 'qs=' + qs.length);
       const q1 = qs.find(q => q.title.indexOf('下列说法正确') > -1);
       const q2 = qs.find(q => q.title.indexOf('古希腊人本主义') > -1);
       ok('题1 被识别为多选题（题干写了“多选题”）', !!(q1 && q1.isMulti && /多选/.test(q1.type)), q1 && (q1.type + '/isMulti=' + q1.isMulti));
@@ -155,6 +164,52 @@
       dot.className = 'before chosen';
       ok('选中态只体现在子节点 .before.chosen 上时，也能判定为已选', dbg.optionSelected(q1a) === true);
       dot.className = 'before';
+
+      // ---------- H. 题库（v3.3.0）：归一化 / 答案解析 / 文本→选项 / 本地库 ----------
+      const q5 = qs.find(q => q.title.indexOf('实践是检验真理') > -1);
+      ok('扫到判断题 q5', !!q5, q5 && q5.type);
+
+      ok('normQuestion：去题号+题型标记、全角转半角、去标点空格',
+        dbg.normQuestion('1.（多选题） 下列 说法，正确的是（）') === '下列说法正确的是',
+        dbg.normQuestion('1.（多选题） 下列 说法，正确的是（）'));
+      ok('normQuestion：全角字母数字也能归一',
+        dbg.normQuestion('ＡＢＣ　１２３') === 'abc123', dbg.normQuestion('ＡＢＣ　１２３'));
+
+      const ba = dbg.bankAnswerToArray;
+      ok('bankAnswerToArray("A#B#C") → 3 项', eq(ba('A#B#C'), ['A', 'B', 'C']));
+      ok('bankAnswerToArray("黑格尔的辩证法#费尔巴哈的唯物论") → 2 项',
+        eq(ba('黑格尔的辩证法#费尔巴哈的唯物论'), ['黑格尔的辩证法', '费尔巴哈的唯物论']));
+      ok('bankAnswerToArray 能剥掉题库返回的 HTML', eq(ba('<b>正确</b>'), ['正确']), JSON.stringify(ba('<b>正确</b>')));
+      ok('bankAnswerToArray("") → 空', eq(ba(''), []));
+
+      const pick = dbg.mapAnswersToOptions;
+      ok('题库答案 "AC" → 选项 A、C',
+        pick(q1, ['AC']).map(o => o.letter).join('') === 'AC', pick(q1, ['AC']).map(o => o.letter).join(''));
+      ok('题库答案「选项文本」→ 正确映射到字母',
+        pick(q1, ['甲是正确的', '丙是正确的']).map(o => o.letter).join('') === 'AC',
+        pick(q1, ['甲是正确的', '丙是正确的']).map(o => o.letter).join(''));
+      ok('题库答案「正确」→ 判断题选到“正确”那一项',
+        (() => { const p = pick(q5, ['正确']); return p.length === 1 && p[0].letter === 'A'; })(),
+        pick(q5, ['正确']).map(o => o.letter).join(','));
+      ok('题库答案「错误」→ 判断题选到“错误”那一项',
+        (() => { const p = pick(q5, ['错误']); return p.length === 1 && p[0].letter === 'B'; })(),
+        pick(q5, ['错误']).map(o => o.letter).join(','));
+      ok('单选题多个文本命中时只保留最匹配的一个',
+        pick({ isMulti: false, options: q1.options }, ['甲是正确的', '丙是正确的']).length === 1,
+        pick({ isMulti: false, options: q1.options }, ['甲是正确的', '丙是正确的']).length);
+
+      // 本地题库：收录 → 按题意命中（纯本地，不联网）
+      dbg.saveLocalBank({});
+      ok('typeToInt 题型编号', dbg.typeToInt('多选题') === 1 && dbg.typeToInt('判断题') === 3 && dbg.typeToInt('填空题') === 2);
+      dbg.rememberQuestion(q5, '正确');
+      ok('本地题库收录后 size=1', dbg.localBankSize() === 1, 'size=' + dbg.localBankSize());
+      const hitMap = await dbg.bankLookup([q5]);
+      const hitV = hitMap.get(q5.index);
+      ok('本地题库能按题意命中（题库优先，不走 AI）', !!(hitV && hitV.src === '本地题库'),
+        hitV && (hitV.src + ' → ' + hitV.answer));
+      ok('本地题库命中的答案能映射回选项',
+        (() => { const p = pick(q5, ba(hitV.answer)); return p.length === 1 && p[0].letter === 'A'; })());
+      dbg.saveLocalBank({});
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }
