@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.8.7
-// @description  学习通(超星)自动答题。v3.8.7 修「提交成功后不点下一节」：提交后成绩/解析弹窗会挡住「下一节」的点击，且页面可能重渲染导致旧文档节点失效；现在提交后先清扫弹窗、重新采集文档再找下一节，并把"任务点未完成"提示收紧（避免成绩弹窗被误判成提交失败）。
+// @version      3.8.8
+// @description  学习通(超星)自动答题。v3.8.8 修「提交成功后不点下一节」的真正原因：提交后学习通显示结果页、隐藏答案框被清空，脚本误以为题目仍"未作答"，于是重新转写+重新作答，陷入死循环走不到下一节；现在已提交的页面直接跳过作答。另修顶部导航条「目录 讨论 笔记 标注」被当成任务点标签。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -2834,6 +2834,15 @@
       if (CONFIG.NEXT_BTN_TEXT.some(k => t.includes(k))) return;   // 别把“下一节”当标签
       if (CONFIG.EXCLUDE_TEXT.some(k => t.includes(k))) return;
       if (el.children && el.children.length > 2) return;           // 包一堆子元素的是大容器
+      // 容器过滤：内部还有同样命中任务点关键词的后代 → 它是外层导航条，不是任务点标签。
+      // 实测顶部的「目录 讨论 笔记 标注」整条导航被当成了任务点（v3.8.8）
+      if (el.querySelectorAll) {
+        const kids = el.querySelectorAll('*');
+        for (let i = 0; i < kids.length; i++) {
+          const dt = cleanText(kids[i].textContent || '');
+          if (dt && dt.length <= 14 && CONFIG.TASK_TAB_TEXT.some(k => dt.includes(k))) return;
+        }
+      }
       seen.add(el);
       const ki = CONFIG.TASK_TAB_TEXT.findIndex(k => t.includes(k));
       let prio = 20 + Math.max(0, ki) + (doc === topDoc ? 0 : 25);
@@ -3018,12 +3027,21 @@
       const questions = collectQuestions(docs);
 
       // 多选题补选：模型给的答案里还有没真正选上的选项，直接补点，不再花一次 API 请求
-      if (await retryPendingMulti(questions)) continue;
+      // （本页已提交过就不再补选 —— 结果页的选项状态不可信）
+      if (!pageSubmitted && (await retryPendingMulti(questions))) continue;
 
       // 拿不到答案超过 3 次的题不再计入 unanswered，避免无限重试
       const unanswered = questions.filter(q => !q.answered && (qAttempts.get(qKeyOf(q)) || 0) < MAX_Q_ATTEMPTS);
 
-      if (unanswered.length) {
+      // ⚠️ 本页已经提交过了：学习通会显示「提交后的结果页」，隐藏答案框被清空 →
+      // 题目看起来又是"未作答"。如果这时重新转写/重新作答，就会陷入
+      // 「提交成功 → 认为未作答 → 再答一遍 → 再提交…」的死循环，永远走不到「下一节」。
+      // 实测就是这个原因导致"提交完不点下一节"（v3.8.8）。
+      if (pageSubmitted && unanswered.length) {
+        log(`本页已提交过，跳过作答（页面仍显示 ${questions.length} 道题，应为提交后的结果页），直接去找下一节`, 'warn');
+      }
+
+      if (unanswered.length && !pageSubmitted) {
         noNextRetries = 0;
         log(`发现 ${questions.length} 道题，其中 ${unanswered.length} 道未作答`);
         const ok = await answerQuestions(unanswered);

@@ -184,6 +184,19 @@
       ok('手动拾取指向错误标签（1 学习目标）时被忽略', t5ids.indexOf('tabGoals') < 0, t5ids.join(','));
       ok('忽略失效拾取后仍能自动识别出 tabQuiz', t5ids.indexOf('tabQuiz') > -1, t5ids.join(','));
       dbg.CONFIG.TASK_TAB_PICKED = savedTabPick;
+
+      // ---- 场景 6：外层导航条不能被当成任务点 ----
+      // 真实日志：「目录 讨论 笔记 标注」这条顶部导航被识别成了任务点3
+      const nav = document.createElement('div');
+      nav.id = 'topNavTest';
+      nav.style.cssText = 'position:absolute;left:900px;top:620px;width:220px;height:28px;';
+      nav.innerHTML = '目录 <a id="navDiscussTest" href="javascript:;">讨论</a> 笔记 标注';
+      document.body.appendChild(nav);
+      const t6 = dbg.collectTaskTabs(dbg.getAllDocs());
+      const t6ids = t6.map(x => x.el.id || '(no-id)');
+      ok('外层导航条「目录 讨论 笔记 标注」不被当成任务点', t6ids.indexOf('topNavTest') < 0, t6ids.join(','));
+      ok('导航条里的叶子「讨论」仍能被识别', t6ids.indexOf('navDiscussTest') > -1, t6ids.join(','));
+      nav.remove();
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }
