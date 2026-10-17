@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.8.5
-// @description  学习通(超星)自动答题。v3.8.5 修提交：学习通是「两级提交」（先点左下角「提交」，右上角才会出现真正的「提交/交卷」），旧逻辑只点一次就以为提交完成，结果点「下一节」被"本节任务点未完成"拦下还误判课程结束。现在提交改为多轮直到没有未点的提交按钮，并能识别"任务点未完成"提示、回去重新提交。
+// @version      3.8.6
+// @description  学习通(超星)自动答题。v3.8.6 修「答完题不提交直接跳过」：handlePopups 在 wait:true 时无弹窗也返回 true，导致 autoSubmit 误以为弹窗已处理、4 轮都不找提交按钮却打印"提交流程已完成"。同时修一批状态机问题：切换任务点后 pageSubmitted 未重置、提交重试无上限、lastNextBlocked 跨轮残留、字体解析失败每轮重跑、加密题重复转写。完整链路：字体hash解密 →（失败）视觉转写文字 → 题库 → 文本AI → 两级提交 → 下一节。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -893,14 +893,35 @@
   }
 
   // 把字体加密的题目转写成真文字（题库检索 + 文本 AI 都依赖它）
+  // 转写结果缓存：乱码题干 key → { title, options }
+  // 注意：主循环每轮都会重新 collectQuestions，DOM 里的 .font-cxsecret 并不会消失，
+  // 所以只"跳过重复转写"是不够的 —— 必须把转写结果【重新写回】每一轮新采集的题目对象，
+  // 否则第二轮起题干又变回乱码，题库必 miss、AI 也收到乱码。
+  const transcriptionCache = new Map();
+  function applyTranscription(q, hit) {
+    if (!hit) return;
+    if (hit.title) q.title = hit.title;
+    if (Array.isArray(hit.options)) {
+      q.options.forEach((o, i) => { if (hit.options[i]) o.text = hit.options[i]; });
+    }
+    q.encrypted = false;
+  }
+
   async function transcribeEncrypted(questions) {
     if (!CONFIG.TRANSCRIBE_ENABLED) return 0;
-    const need = questions.filter(q => q.encrypted && q.box);
+    const need = [];
+    questions.forEach(q => {
+      if (!q.encrypted || !q.box) return;
+      const hit = transcriptionCache.get(bankKey(q));
+      if (hit) { applyTranscription(q, hit); return; }   // 回填上一轮的转写结果
+      need.push(q);
+    });
     if (!need.length) return 0;
     log(`有 ${need.length} 道题字体加密且没解开，改用视觉转写文字（每道题多一次截图请求）…`, 'warn');
     let done = 0;
     for (const q of need) {
       if (!running) break;
+      const tk = bankKey(q);   // 转写前的乱码题干作 key
       try {
         setStatus(`转写第 ${q.index} 题…`);
         const img = await shotQuestion(q);
@@ -916,6 +937,7 @@
           });
         }
         q.encrypted = false;
+        if (tk) transcriptionCache.set(tk, { title: q.title, options: q.options.map(o => o.text) });
         done++;
         log(`第 ${q.index} 题已转写：${q.title.slice(0, 40)}`, 'ok');
       } catch (e) {
@@ -1304,6 +1326,9 @@
   // 关键点：多选题只要有一个目标选项没真正选上，主循环就会重试点击，
   // 而不是因为 answered=true 就当它做完了 —— 这正是“多选只选上一个就跑了”的原因。
   const multiPlan = new Map();   // 题目 key → { letters: 期望选中的字母, tries: 已补选次数 }
+  // 题目级尝试次数：拿不到答案的题最多试 3 次，否则主循环会每轮都为它打一次题库+AI（无限烧 token）
+  const qAttempts = new Map();
+  const MAX_Q_ATTEMPTS = 3;
   function qKeyOf(q) { return ((q.title || '').replace(/\s+/g, '')).slice(0, 60) + '#' + q.options.length; }
   function selectedLetters(q) {
     return q.options.filter(o => o.checked || optionSelected(o)).map(o => o.letter);
@@ -1333,6 +1358,7 @@
   let fontScanLogged = false;    // 扫描结果只报一次
   let fontFailLogged = false;    // 失败原因只报一次
   let fontFailReason = '';
+  let fontOutcome = null;   // { key, map|null, reason } —— 同一份字体的解析结论缓存，避免每轮重复解析
 
   async function ensureMd5() {
     if (typeof md5 === 'function') return md5;
@@ -1519,7 +1545,8 @@
     return 0;
   }
   async function buildFontMap(docs) {
-    if (fontMapCache) return fontMapCache;
+    // 注意：这里不能提前 `if (fontMapCache) return`，否则下面的 fontKey 比较永远走不到，
+    // 换章节/换字体后会一直复用旧映射（审计发现）。
     // 1) 任意一个 frame 的 <style> 里找内嵌字体（字体样式和内容不一定在同一个文档）
     let css = '';
     for (const doc of docs) {
@@ -1555,14 +1582,25 @@
     // 字体变了就重建映射（不同章节可能换字体）
     const fontKey = b64.length + ':' + b64.slice(0, 32);
     if (fontMapCache && fontMapCacheKey === fontKey) return fontMapCache;
+    // 同一份字体已经得出过结论（成功或失败）→ 直接复用，避免每轮主循环都重新跑一遍
+    // 2 万次 glyphToPath + md5 的昂贵解析
+    if (fontOutcome && fontOutcome.key === fontKey) {
+      fontFailReason = fontOutcome.reason || fontFailReason;
+      return fontOutcome.map;
+    }
+    const failFont = reason => {
+      fontFailReason = reason;
+      fontOutcome = { key: fontKey, map: null, reason };
+      return null;
+    };
     log(`字体解密：找到内嵌字体（base64 ${Math.round(b64.length / 1024)}KB），开始还原…`);
 
     const typr = await ensureTypr();
-    if (!typr) { fontFailReason = 'Typr 字体解析库加载失败（CDN 不通？）'; return null; }
+    if (!typr) return failFont('Typr 字体解析库加载失败（CDN 不通？）');
     const md5fn = await ensureMd5();
-    if (!md5fn) { fontFailReason = 'md5 库加载失败（CDN 不通？）'; return null; }
+    if (!md5fn) return failFont('md5 库加载失败（CDN 不通？）');
     const table = await ensureFontTable();
-    if (!table) { fontFailReason = '字体映射表 table.json 不可用'; return null; }
+    if (!table) return failFont('字体映射表 table.json 不可用');
 
     let arr;
     try {
@@ -1570,8 +1608,7 @@
       arr = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
     } catch (e) {
-      fontFailReason = 'base64 字体解码失败：' + (e && e.message);
-      return null;
+      return failFont('base64 字体解码失败：' + (e && e.message));
     }
 
     // 字体魔数：Typr 只认 sfnt（TTF/OTF），不认压缩的 WOFF/WOFF2
@@ -1582,13 +1619,12 @@
     };
     log(`字体解密：字体格式 0x${magic} → ${MAGIC[magic] || '未知'}`);
     if (magic.slice(0, 6) === '774f46') {
-      fontFailReason = '内嵌字体是压缩格式（WOFF/WOFF2），Typr 解不了';
-      return null;
+      return failFont('内嵌字体是压缩格式（WOFF/WOFF2），Typr 解不了');
     }
 
     let font;
     try { font = typr.parse(arr.buffer || arr); }
-    catch (e) { fontFailReason = '字体解析失败：' + (e && e.message); return null; }
+    catch (e) { return failFont('字体解析失败：' + (e && e.message)); }
 
     // cmap：Typr 有时整张表都没解出来，这时自己从二进制里解析一遍
     let cmapTables = (font.cmap && font.cmap.tables) || [];
@@ -1601,8 +1637,7 @@
       }
     }
     if (!cmapTables.length) {
-      fontFailReason = '字体里没有可用的 cmap 表（Typr 与自研解析都没取到）';
-      return null;
+      return failFont('字体里没有可用的 cmap 表（Typr 与自研解析都没取到）');
     }
 
     const map = {};
@@ -1624,13 +1659,13 @@
     const n = Object.keys(map).length;
     log(`字体解密：字体里解析出 ${glyphCnt} 个中文字形，映射命中 ${n} 个`);
     if (!n) {
-      fontFailReason = glyphCnt === 0
+      return failFont(glyphCnt === 0
         ? '字体 cmap 里没解析出任何中文字形（可能是子集字体或格式不支持）'
-        : `字形 hash 与映射表对不上（样例 md5=${sampleH}）`;
-      return null;
+        : `字形 hash 与映射表对不上（样例 md5=${sampleH}）`);
     }
     fontMapCache = map;
     fontMapCacheKey = fontKey;
+    fontOutcome = { key: fontKey, map, reason: '' };
     log(`字体解密：建立映射 ${n} 个码位`, 'ok');
     return map;
   }
@@ -1692,8 +1727,11 @@
     const picked = [];
     const pushOpt = opt => { if (opt && !picked.includes(opt)) picked.push(opt); };
 
-    // ① 字母
-    extractLetters(ans).forEach(letter => pushOpt(q.options.find(o => o.letter === letter)));
+    // ① 字母（单选/判断只取第一个：AI 多给字母时若在 radio 上点两次，只剩最后一个选中，
+    //    日志却会写"已选 A、B"——审计发现）
+    const letters = extractLetters(ans);
+    if (!q.isMulti) letters.splice(1);
+    letters.forEach(letter => pushOpt(q.options.find(o => o.letter === letter)));
 
     // ② 选项文本
     if (!picked.length) {
@@ -1805,7 +1843,14 @@
       if (!running) return false;
       const ans = answers[q.index];
       const src = sources[q.index] ? '[' + sources[q.index] + '] ' : '';
-      if (!ans || !ans.length) { log(`第 ${q.index} 题未取得答案，跳过`, 'warn'); continue; }
+      if (!ans || !ans.length) {
+        const kk = qKeyOf(q);
+        const n = (qAttempts.get(kk) || 0) + 1;
+        qAttempts.set(kk, n);
+        if (n >= MAX_Q_ATTEMPTS) log(`第 ${q.index} 题连续 ${n} 次都拿不到答案，后续不再重试，请人工补答`, 'err');
+        else log(`第 ${q.index} 题未取得答案，跳过（第 ${n}/${MAX_Q_ATTEMPTS} 次）`, 'warn');
+        continue;
+      }
 
       try { q.box.scrollIntoView({ block: 'center' }); } catch (e) {}
       await sleep(200);
@@ -1962,7 +2007,7 @@
   }
 
   async function clickOption(opt, isMulti, opts) {
-    const li = opt.li || (opt.el && opt.el.tagName === 'LI' ? opt.el : opt.el);
+    const li = opt.li || opt.el;
     if (!li) return false;
     const blockText = ((li.closest && li.closest('.TiMu')) || {}).textContent || '';
     const multi = isMulti === true || MULTI_RE.test(blockText);
@@ -2282,6 +2327,11 @@
   function findClickable(docs, texts, extraSel, skipSet) {
     const candidates = [];
     const seen = new Set();
+    const sigOf = el => {
+      let pos = '';
+      try { const r = el.getBoundingClientRect(); pos = Math.round(r.left) + ',' + Math.round(r.top); } catch (e) {}
+      return cleanText(el.textContent || el.value || '') + '|' + (el.tagName || '') + '|' + (el.id || '') + '|' + pos;
+    };
     docs.forEach(doc => {
       let els = Array.from(doc.querySelectorAll(
         'button,a,[role=button],input[type=button],input[type=submit],li,div,span,p,.btn'
@@ -2290,13 +2340,15 @@
       els.forEach(el => {
         if (!el || seen.has(el)) return;
         seen.add(el);
-        if (skipSet && skipSet.has(el)) return;
+        const sig = sigOf(el);
+        // skipSet 可以放元素，也可以放签名 —— 页面重渲染后元素被替换，但签名还能对上
+        if (skipSet && (skipSet.has(el) || skipSet.has(sig))) return;
         if (!isVisible(el)) return;
         if (isOwnUI(el)) return;
         const t = cleanText(el.textContent || el.value || '');
         if (!t || t.length > 12) return;
         if (CONFIG.EXCLUDE_TEXT.some(x => t.includes(x))) return;
-        if (texts.some(x => t === x || t.includes(x))) candidates.push({ el, doc, t });
+        if (texts.some(x => t === x || t.includes(x))) candidates.push({ el, doc, t, sig });
       });
     });
     // 优先叶子元素（避免点到外层大容器）
@@ -2476,8 +2528,10 @@
   // wait=true 时（刚点完提交）会多轮等待弹窗出现；wait=false 时无弹窗立即返回。
   async function handlePopups(docs, opts = {}) {
     const wait = !!opts.wait;
-    const rounds = wait ? 10 : 1;
+    // rounds 可调：wait:true 默认等 10 轮（≈7s），提交流程里只需要等 3 轮（≈2s）
+    const rounds = wait ? (opts.rounds || 10) : 1;
     const RESULT_CLOSE = ['关闭', '我知道了', '知道了', '完成', '查看答案', '确定'];
+    let actedAny = false;   // 必须是"真的点了弹窗"才算 acted，否则 wait:true 恒返回 true 会让调用方以为已处理
 
     for (let round = 0; round < rounds; round++) {
       const allDocs = getAllDocs();
@@ -2525,6 +2579,7 @@
             await sleep(400);
             nativeClick(best.b);
             acted = true;
+            actedAny = true;
             await sleep(1600);
             break;
           }
@@ -2533,11 +2588,11 @@
       }
 
       if (!acted) {
-        if (!wait) return false;
+        if (!wait) return actedAny;
         await sleep(700); // 等弹窗动画/加载
       }
     }
-    return true;
+    return actedAny;
   }
 
   // 提交流程：学习通是「两级提交」——
@@ -2546,30 +2601,36 @@
   // 直到页面上找不到新的提交按钮为止（最多 4 轮）。
   async function autoSubmit(docs) {
     if (!CONFIG.AUTO_SUBMIT) return false;
-    const clicked = new WeakSet();
+    const clicked = new Set();   // 同时记元素和签名：页面重渲染换了节点，签名还能拦住重复点击
     let acted = false;
     for (let round = 0; round < 4; round++) {
       if (!running) break;
-      // 1) 先处理已经出现的确认/结果弹窗
-      if (await handlePopups(getAllDocs(), { wait: true })) {
+      // 1) 静默处理已经存在的确认弹窗。
+      //    ⚠️ 这里必须用 wait:false —— wait:true 会空等最多 7 秒（10 轮 × 700ms），
+      //    而且（旧版）恒返回 true，会让下面的逻辑误以为"已经处理过了"而跳过提交按钮。
+      if (await handlePopups(getAllDocs(), { wait: false })) {
         acted = true;
-        await sleep(1000);
+        await sleep(900);
         continue;
       }
-      // 2) 找下一个「还没点过」的提交按钮
+      // 2) 找下一个「还没点过」的提交按钮（左下角提交 → 右上角提交，两级）
       const btn = findClickable(getAllDocs(), CONFIG.SUBMIT_TEXT,
         '#submitData,.submitBtn,.tj_btn,.Btn_blue_3,[class*="submit"]', clicked);
       if (!btn) break;
       clicked.add(btn.el);
+      if (btn.sig) clicked.add(btn.sig);
       log(`找到「${btn.t}」按钮，准备提交…${round ? '（第 ' + (round + 1) + ' 级提交）' : ''}`, 'warn');
       try { btn.el.scrollIntoView({ block: 'center' }); } catch (e) {}
       await sleep(400);
       nativeClick(btn.el);
       acted = true;
-      await sleep(1600);
+      await sleep(1500);
+      // 3) 点完之后才等确认弹窗（这一步才值得用 wait:true；只等 3 轮≈2s，避免空耗）
+      await handlePopups(getAllDocs(), { wait: true, rounds: 3 });
+      await sleep(600);
     }
-    // 3) 收尾：再扫一遍弹窗；若仍提示"任务点未完成"则说明没提交成功
-    await handlePopups(getAllDocs(), { wait: true });
+    // 收尾：再静默扫一遍弹窗；若仍提示"任务点未完成"则说明没提交成功
+    await handlePopups(getAllDocs(), { wait: false });
     if (await handleUnfinishedBlock()) {
       log('提交未成功：页面提示任务点未完成，下一轮会重新提交', 'err');
       return false;
@@ -2582,6 +2643,7 @@
   // 提交后页面会重渲染，题干文本可能变，用签名去重会失效（实测重复提交了两次）。
   let pageSubmitted = false;
   let lastNextBlocked = false;   // 点「下一节」被"任务点未完成"拦下
+  let submitRetryCount = 0;      // 连续"被拦→重提交"的次数，防止死循环
   async function submitOnce(docs, questions) {
     if (pageSubmitted) { log('本页已提交过，跳过重复提交'); return; }
     if (await autoSubmit(docs)) pageSubmitted = true;
@@ -2838,6 +2900,7 @@
   // 逐个尝试候选：点完没跳转就把这个元素拉黑、换下一个，
   // 而不是像旧版那样反复点同一个元素（这是“卡住/提前收工”的根因）。
   async function clickNextWithRetry(cands, isVideo) {
+    lastNextBlocked = false;   // 每次尝试前先清掉上一次的拦截标记，避免串到下一条分支
     for (const c of cands) {
       if (!running) return false;
       const before = taskSignature(getAllDocs());
@@ -2868,7 +2931,8 @@
     }
     clearHighlight();
     // 所有候选都失败时，再兜底处理一次可能挡路的弹窗（例如“任务点未完成”提示）
-    await handlePopups(getAllDocs(), { wait: true });
+    // 只等 3 轮≈2s：这里只是兜底，没必要空耗 7 秒
+    await handlePopups(getAllDocs(), { wait: true, rounds: 3 });
     return false;
   }
 
@@ -2929,7 +2993,8 @@
       // 多选题补选：模型给的答案里还有没真正选上的选项，直接补点，不再花一次 API 请求
       if (await retryPendingMulti(questions)) continue;
 
-      const unanswered = questions.filter(q => !q.answered);
+      // 拿不到答案超过 3 次的题不再计入 unanswered，避免无限重试
+      const unanswered = questions.filter(q => !q.answered && (qAttempts.get(qKeyOf(q)) || 0) < MAX_Q_ATTEMPTS);
 
       if (unanswered.length) {
         noNextRetries = 0;
@@ -2965,6 +3030,8 @@
           const switched = await clickNextWithRetry(tabs, false);
           if (switched) {
             tabs.forEach(t => visitedTabs.add(t.key));
+            pageSubmitted = false;   // 切到另一个任务点=新的题目页，允许重新提交
+            submitRetryCount = 0;
             continue;
           }
           log('任务点标签点了都没反应，改为找“下一节”', 'warn');
@@ -2988,13 +3055,19 @@
           sections++;
           resetVisitedTabs();          // 换小节了，任务点标签重新计数
           pageSubmitted = false;       // 换小节了，允许重新提交
+          submitRetryCount = 0;
           if (sections > CONFIG.MAX_SECTIONS) { log('达到最大节数限制，停止', 'warn'); break; }
         } else if (lastNextBlocked) {
           // 被"任务点未完成"拦下 → 重新走提交流程，而不是继续点下一节
           lastNextBlocked = false;
           noNextRetries = 0;
           pageSubmitted = false;
-          log('提交未成功导致「下一节」被拦，重新走一遍提交流程…', 'warn');
+          submitRetryCount++;
+          if (submitRetryCount > 5) {
+            log('连续 5 次提交都被「任务点未完成」拦下，已停止：请人工检查（可能有题目没答完，或提交按钮识别不到）', 'err');
+            break;
+          }
+          log(`提交未成功导致「下一节」被拦，重新走一遍提交流程…（第 ${submitRetryCount} 次重试）`, 'warn');
           await submitOnce(getAllDocs(), questions);
           await sleep(1200);
           continue;
@@ -3196,12 +3269,27 @@
     }
     running = true;
     sections = 0;
+    // 每次启动都把所有跨轮状态清干净（审计发现：停止后在同页重启会带着上一轮结果，
+    // pageSubmitted=true 会直接跳过提交，badNextEls 残留会忽略「下一节」）
     resetVisitedTabs();
+    resetBadNext();
     multiPlan.clear();
+    qAttempts.clear();
+    transcriptionCache.clear();
+    pageSubmitted = false;
+    lastNextBlocked = false;
+    submitRetryCount = 0;
+    fontScanLogged = false;
+    fontFailLogged = false;
     ui.start.style.display = 'none';
     ui.stop.style.display = 'block';
     log(`任务启动，模型：${CONFIG.MODEL}（加密题截图识别固定使用 deepseek-flash）`, 'ok');
-    mainLoop();
+    // mainLoop 内部没有 try/catch：裸调用一旦抛异常，running 仍是 true，UI 会卡在“停止”态
+    // 且完全没有日志、用户无从判断（审计发现）。
+    mainLoop().catch(e => {
+      try { log('主循环异常：' + ((e && e.message) || e) + '，已停止', 'err'); } catch (e2) {}
+      try { finish(); } catch (e2) {}
+    });
   }
   function stop() {
     if (!running) return;
@@ -3235,7 +3323,7 @@
       getPageFn, hiddenAnswerLetters, nativeClick,
       decodeFontObfuscation, ensureTypr, ensureMd5, ensureFontTable, buildFontMap, submitOnce,
       transcribeEncrypted, glmTranscribeRequest, parseTranscription, glyphInTable, glyphForCode, parseCmapFromBuffer,
-      findClickable, handleUnfinishedBlock, autoSubmit, UNFINISHED_RE
+      findClickable, handleUnfinishedBlock, autoSubmit, UNFINISHED_RE, handlePopups, pageSubmitted: () => pageSubmitted
     };
   } catch (e) {}
 

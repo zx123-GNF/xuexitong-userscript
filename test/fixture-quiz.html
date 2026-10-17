@@ -419,6 +419,15 @@
 
         subL.remove(); subR.remove();
       })();
+
+      // ---------- Q. handlePopups 返回值语义（v3.8.6 关键修复） ----------
+      // 关键：没有弹窗时 wait:true 也必须返回 false。
+      // 旧版无论有没有弹窗都返回 true，导致 autoSubmit 第一句就"成功"并 continue，
+      // 4 轮下来一次提交按钮都没找过，却打印"提交流程已完成"——
+      // 这就是"答完题不提交、直接把当页当下一页扫描"的根因。
+      const noPop = await dbg.handlePopups(dbg.getAllDocs(), { wait: true });
+      ok('无弹窗时 handlePopups(wait:true) 必须返回 false（旧版恒 true 会跳过提交）',
+        noPop === false, 'ret=' + noPop);
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }
