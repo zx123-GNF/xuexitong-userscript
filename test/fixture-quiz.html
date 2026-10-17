@@ -341,6 +341,14 @@
       // ---------- L. 字体混淆解密：无混淆字体时必须安全跳过、不拉外部依赖 ----------
       const dec = await dbg.decodeFontObfuscation(dbg.getAllDocs());
       ok('字体解密：页面无 .font-cxsecret 时安全返回 0（不会去加载 CDN）', dec === 0, 'ret=' + dec);
+
+      // ---------- M. 视觉转写结果解析（图像→文字链路） ----------
+      const t1 = dbg.parseTranscription('{"title":"题干原文","options":["甲","乙"]}');
+      ok('parseTranscription 能解析转写 JSON', !!(t1 && t1.title === '题干原文' && t1.options.length === 2));
+      const t2 = dbg.parseTranscription('```json\n{"title":"题干","options":[]}\n```');
+      ok('parseTranscription 兼容 markdown 代码块包裹', !!(t2 && t2.title === '题干'));
+      ok('parseTranscription 无 title 时返回 null', dbg.parseTranscription('{"foo":1}') === null);
+      ok('parseTranscription 非 JSON 返回 null', dbg.parseTranscription('完全不是 json') === null);
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }

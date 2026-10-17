@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.7.1
-// @description  学习通(超星)自动答题。v3.7.1 修复字体解密"扫描阶段就空手而归"的逻辑漏洞（不再把文档永久标记为已尝试，并全程打印诊断：找到几个混淆元素/字体/映射多少码位/失败原因），同时让本地题库回写可统计（"已收录 N 题"）。v3.7.0 新增字体混淆解密（字形轮廓 md5 查表还原真字，不用 AI）。v3.6.0 根治多选选不上。
+// @version      3.8.0
+// @description  学习通(超星)自动答题。v3.8.0 完成「图像→文字→题库→AI」链路：字体解密解不开时，先用视觉模型把题干/选项转写成真文字（只转写不答题），再拿真文字查题库，最后才发文字给 AI；同时给字体解密补上决定性诊断（字体魔数/解析出多少字形/映射命中数/样例 md5）。v3.7.x 字体混淆解密；v3.6.0 根治多选选不上。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -77,6 +77,9 @@
     // 解法（与「满分助手」同源）：用页面内嵌的字体算出每个码位的字形轮廓，
     // 取其 md5 前 24 位去映射表里查真字 —— 纯查表，不消耗 AI。
     FONT_DECODE_ENABLED: true,
+    // 字体解密失败时的兜底：用视觉模型把题干「转写成文字」（不答题），
+    // 转成真文字后题库才查得到。这会为每道加密题多花一次截图+请求。
+    TRANSCRIBE_ENABLED: true,
     TYPR_URLS: [
       'https://cdn.jsdelivr.net/npm/typr.js@1.0.0/index.js',
       'https://cdn.jsdelivr.net/gh/photopea/Typr.js@master/src/Typr.js',
@@ -844,6 +847,86 @@
     });
   }
 
+  // 只做「转写」：把截图里的题目原样转成文字（不答题）。
+  // 用于字体加密解不开时 —— 转成真文字后，题库检索和文本 AI 才能正常工作。
+  function glmTranscribeRequest(img) {
+    const prompt = '这是一张学习通题目的截图。请把题干和所有选项【原样转写成文字】，不要答题、不要翻译、不要解释。\n' +
+      '严格只输出 JSON，不要输出 markdown 代码块：\n' +
+      '{"title":"题干原文","type":"单选题/多选题/判断题/填空题","options":["第一个选项内容","第二个选项内容"]}\n' +
+      '注意：options 里不要带 A/B/C/D 字母前缀，只写选项内容本身；实在看不清的字用「?」代替。';
+    const content = [
+      { type: 'text', text: prompt },
+      { type: 'image_url', image_url: { url: img, detail: 'high' } }
+    ];
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: CONFIG.API_URL,
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + CONFIG.API_KEY },
+        data: JSON.stringify({
+          model: CONFIG.MODEL_VISION,
+          temperature: 0,
+          messages: [{ role: 'user', content }]
+        }),
+        timeout: 120000,
+        onload: r => {
+          try {
+            const data = JSON.parse(r.responseText);
+            if (data.error || r.status >= 400) return reject(new Error(formatApiError(r.status, r.responseText)));
+            resolve(data.choices?.[0]?.message?.content || '');
+          } catch (e) { reject(new Error('转写响应解析失败: ' + r.responseText.slice(0, 200))); }
+        },
+        onerror: () => reject(new Error('转写请求失败（检查网络/跨域授权）')),
+        ontimeout: () => reject(new Error('转写请求超时'))
+      });
+    });
+  }
+
+  function parseTranscription(text) {
+    let obj = null;
+    try { obj = JSON.parse(text); } catch (e) {
+      const m = String(text || '').match(/\{[\s\S]*\}/);
+      if (m) { try { obj = JSON.parse(m[0]); } catch (e2) {} }
+    }
+    if (!obj || typeof obj !== 'object' || !obj.title) return null;
+    return obj;
+  }
+
+  // 把字体加密的题目转写成真文字（题库检索 + 文本 AI 都依赖它）
+  async function transcribeEncrypted(questions) {
+    if (!CONFIG.TRANSCRIBE_ENABLED) return 0;
+    const need = questions.filter(q => q.encrypted && q.box);
+    if (!need.length) return 0;
+    log(`有 ${need.length} 道题字体加密且没解开，改用视觉转写文字（每道题多一次截图请求）…`, 'warn');
+    let done = 0;
+    for (const q of need) {
+      if (!running) break;
+      try {
+        setStatus(`转写第 ${q.index} 题…`);
+        const img = await shotQuestion(q);
+        const txt = await glmTranscribeRequest(img);
+        const obj = parseTranscription(txt);
+        if (!obj) { log(`第 ${q.index} 题转写结果解析失败`, 'warn'); continue; }
+        const title = cleanText(obj.title).slice(0, 600);
+        if (title && title.length >= 4) q.title = title;
+        if (Array.isArray(obj.options)) {
+          q.options.forEach((o, i) => {
+            const t = cleanText(String(obj.options[i] == null ? '' : obj.options[i])).slice(0, 300);
+            if (t) o.text = t;
+          });
+        }
+        q.encrypted = false;
+        done++;
+        log(`第 ${q.index} 题已转写：${q.title.slice(0, 40)}`, 'ok');
+      } catch (e) {
+        log(`第 ${q.index} 题转写失败：${e.message}`, 'warn');
+      }
+      await sleep(200);
+    }
+    if (done) log(`视觉转写完成 ${done}/${need.length} 题，接下来用真实文字查题库`, 'ok');
+    return done;
+  }
+
   function buildPrompt(questions) {
     let p = '请回答以下题目，严格只输出 JSON 数组，格式：\n' +
       '[{"index":题号,"answer":["A"]}]\n' +
@@ -1353,31 +1436,57 @@
     const table = await ensureFontTable();
     if (!table) { fontFailReason = '字体映射表 table.json 不可用'; return null; }
 
-    let font;
+    let arr;
     try {
       const bin = atob(b64);
-      const arr = new Uint8Array(bin.length);
+      arr = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-      font = typr.parse(arr.buffer || arr);
     } catch (e) {
-      fontFailReason = '字体解析失败：' + (e && e.message);
+      fontFailReason = 'base64 字体解码失败：' + (e && e.message);
       return null;
     }
 
+    // 字体魔数：Typr 只认 sfnt（TTF/OTF），不认压缩的 WOFF/WOFF2
+    const magic = Array.from(arr.slice(0, 4)).map(b => ('0' + b.toString(16)).slice(-2)).join('');
+    const MAGIC = {
+      '00010000': 'TrueType(支持)', '4f54544f': 'OpenType/CFF(支持)', '74727565': 'TrueType(支持)',
+      '774f4646': 'WOFF(不支持)', '774f4632': 'WOFF2(不支持)'
+    };
+    log(`字体解密：字体格式 0x${magic} → ${MAGIC[magic] || '未知'}`);
+    if (magic.slice(0, 6) === '774f46') {
+      fontFailReason = '内嵌字体是压缩格式（WOFF/WOFF2），Typr 解不了';
+      return null;
+    }
+
+    let font;
+    try { font = typr.parse(arr.buffer || arr); }
+    catch (e) { fontFailReason = '字体解析失败：' + (e && e.message); return null; }
+
     const map = {};
+    let glyphCnt = 0, sampleH = '';
     for (let cp = 19968; cp < 40870; cp++) {
       let g = 0;
       try { g = typr.U.codeToGlyph(font, cp); } catch (e) { g = 0; }
       if (!g) continue;
+      glyphCnt++;
       try {
         const path = typr.U.glyphToPath(font, g);
-        const h = md5fn(JSON.stringify(path)).slice(24);
-        const real = table[h];
+        // 不同 Typr 版本序列化可能不同，几种常见 md5 切片都试一遍
+        const h32 = md5fn(JSON.stringify(path));
+        const real = table[h32.slice(24)] || table[h32.slice(0, 8)] || table[h32]
+          || table[h32.slice(8, 16)] || table[h32.slice(16, 24)];
         if (typeof real === 'number' && real > 0) map[cp] = real;
+        else if (!sampleH) sampleH = h32;
       } catch (e) {}
     }
     const n = Object.keys(map).length;
-    if (!n) { fontFailReason = '映射表里对不上这个字体（字体可能换新版了）'; return null; }
+    log(`字体解密：字体里解析出 ${glyphCnt} 个中文字形，映射命中 ${n} 个`);
+    if (!n) {
+      fontFailReason = glyphCnt === 0
+        ? '字体 cmap 里没解析出任何中文字形（可能是子集字体或格式不支持）'
+        : `字形 hash 与映射表对不上（样例 md5=${sampleH}）`;
+      return null;
+    }
     fontMapCache = map;
     fontMapCacheKey = fontKey;
     log(`字体解密：建立映射 ${n} 个码位`, 'ok');
@@ -1476,6 +1585,13 @@
   async function answerQuestions(questions) {
     const answers = {};
     const sources = {};
+
+    // ========== 第零段：字体加密的题先转写成真文字 ==========
+    // 不转写的话，题库拿到的是乱码，AI 也读不懂题干。
+    if (questions.some(q => q.encrypted)) {
+      try { await transcribeEncrypted(questions); } catch (e) { log('转写异常：' + e.message, 'warn'); }
+      if (!running) return false;
+    }
 
     // ========== 第一段：题库（本地 → 自定义 → 免费公开） ==========
     try {
@@ -2889,7 +3005,8 @@
       loadLocalBank, saveLocalBank, localBankSize, rememberQuestion, bankLookup, typeToInt,
       bankQueryText, queryFreeBank, queryFreeBank2, isBankGarbage, BANK_AD_RE, refreshQuestion, recentClicks, questionReport,
       getPageFn, hiddenAnswerLetters, nativeClick,
-      decodeFontObfuscation, ensureTypr, ensureMd5, ensureFontTable, buildFontMap, submitOnce
+      decodeFontObfuscation, ensureTypr, ensureMd5, ensureFontTable, buildFontMap, submitOnce,
+      transcribeEncrypted, glmTranscribeRequest, parseTranscription
     };
   } catch (e) {}
 
