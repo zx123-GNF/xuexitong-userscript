@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.8.1
-// @description  学习通(超星)自动答题。v3.8.1 修字体解密最后一道坎：学习通的字体 cmap 用的是 p3e10/format12，而 Typr 的 codeToGlyph 只认 p0e4/p3e1/p1e0，所以"解析出 0 个中文字形"；改成自己遍历所有 cmap 子表（format 12/4/6/0）查字形。加上 v3.8.0 的视觉转写兜底（图像→文字→题库→AI）。v3.6.0 根治多选选不上。
+// @version      3.8.2
+// @description  学习通(超星)自动答题。v3.8.2 修字体解密：Typr 有时整张 cmap 表都解不出来，改成自己从字体二进制里解析 cmap（format 12/4/6），并优先从「font-family 含 font-cxsecret 的 @font-face」取字体（同一 style 里可能有多个字体）。配合 v3.8.0 的视觉转写兜底，构成「字体hash解密 → 视觉转写 → 题库 → 文本AI」。v3.6.0 根治多选选不上。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -1398,6 +1398,65 @@
     return fontTablePromise;
   }
 
+  // 直接从字体二进制里解析 cmap 表（绕过 Typr 可能漏读 cmap 的情况）。
+  // 返回与 glyphInTable 兼容的子表结构数组。
+  function parseCmapFromBuffer(buf) {
+    try {
+      const u8 = new Uint8Array(buf.buffer || buf);
+      const u16 = p => (u8[p] << 8) | u8[p + 1];
+      const u32 = p => (((u8[p] << 24) | (u8[p + 1] << 16) | (u8[p + 2] << 8) | u8[p + 3]) >>> 0);
+      const numTables = u16(4);
+      let cmapOff = -1;
+      for (let i = 0; i < numTables; i++) {
+        const o = 12 + i * 16;
+        const tag = String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+        if (tag === 'cmap') { cmapOff = u32(o + 8); break; }
+      }
+      if (cmapOff <= 0) return null;
+      const numSub = u16(cmapOff + 2);
+      const tables = [];
+      for (let i = 0; i < numSub; i++) {
+        const rec = cmapOff + 4 + i * 8;
+        const platformID = u16(rec), encodingID = u16(rec + 2);
+        const subOff = cmapOff + u32(rec + 4);
+        const format = u16(subOff);
+        let tab = null;
+        if (format === 12) {
+          const nGroups = u32(subOff + 12);
+          const groups = [];
+          for (let g = 0; g < nGroups && g < 20000; g++) {
+            const o = subOff + 16 + g * 12;
+            groups.push([u32(o), u32(o + 4), u32(o + 8)]);
+          }
+          tab = { format: 12, groups };
+        } else if (format === 4) {
+          const seg = u16(subOff + 6) / 2;
+          const endO = subOff + 14, startO = endO + seg * 2 + 2;
+          const deltaO = startO + seg * 2, rangeO = deltaO + seg * 2;
+          const endCount = [], startCount = [], idDelta = [], idRangeOffset = [];
+          for (let s = 0; s < seg; s++) {
+            endCount.push(u16(endO + s * 2));
+            startCount.push(u16(startO + s * 2));
+            idDelta.push((u16(deltaO + s * 2) << 16) >> 16);
+            idRangeOffset.push(u16(rangeO + s * 2));
+          }
+          const glyphIdArray = [];
+          const arrStart = rangeO + seg * 2;
+          const tblEnd = Math.min(u8.length, subOff + u16(subOff + 2));
+          for (let p = arrStart; p + 1 < tblEnd; p += 2) glyphIdArray.push(u16(p));
+          tab = { format: 4, endCount, startCount, idDelta, idRangeOffset, glyphIdArray };
+        } else if (format === 6) {
+          const firstCode = u16(subOff + 6), entryCount = u16(subOff + 8);
+          const glyphIdArray = [];
+          for (let k = 0; k < entryCount; k++) glyphIdArray.push(u16(subOff + 10 + k * 2));
+          tab = { format: 6, firstCode, glyphIdArray };
+        }
+        if (tab) { tab.platformID = platformID; tab.encodingID = encodingID; tables.push(tab); }
+      }
+      return tables.length ? tables : null;
+    } catch (e) { return null; }
+  }
+
   // 在单个 cmap 子表里查码位 → 字形 id
   function glyphInTable(tab, code) {
     try {
@@ -1442,20 +1501,21 @@
   // 遍历字体里【所有】cmap 子表找字形 id。
   // Typr.U.codeToGlyph 只认 p0e4 / p3e1 / p1e0 三种平台编码；
   // 学习通这份字体用的是 p3e10（format 12）之类，所以它一个都查不到 —— v3.8.1 修的就是这个。
-  function glyphForCode(font, code) {
+  function glyphForCode(fontOrTables, code) {
+    let tabs = [];
     try {
-      const cmap = font && font.cmap;
-      const tabs = (cmap && cmap.tables) || [];
-      // 优先级：format12（UCS-4）> format4 > format6 > format0
-      const order = [12, 4, 6, 0];
-      for (const fmt of order) {
-        for (const tab of tabs) {
-          if (!tab || tab.format !== fmt) continue;
-          const g = glyphInTable(tab, code);
-          if (g) return g;
-        }
-      }
+      if (Array.isArray(fontOrTables)) tabs = fontOrTables;
+      else if (fontOrTables && fontOrTables.cmap && fontOrTables.cmap.tables) tabs = fontOrTables.cmap.tables;
     } catch (e) {}
+    // 优先级：format12（UCS-4）> format4 > format6 > format0
+    const order = [12, 4, 6, 0];
+    for (const fmt of order) {
+      for (const tab of tabs) {
+        if (!tab || tab.format !== fmt) continue;
+        const g = glyphInTable(tab, code);
+        if (g) return g;
+      }
+    }
     return 0;
   }
   async function buildFontMap(docs) {
@@ -1473,8 +1533,17 @@
     }
     if (!css) { fontFailReason = '没在任何 <style> 里找到内嵌的混淆字体(base64)'; return null; }
 
-    let m = css.match(/base64,([\w\W]+?)['"]/);
-    if (!m) m = css.match(/base64,([A-Za-z0-9+\/=]+)/);   // 有的写法 url(...) 里不加引号
+    // 优先从「font-family 含 font-cxsecret 的那个 @font-face」里取 base64。
+    // 同一段 <style> 里可能有多个字体，取错就会解析出一个没有 cmap 的其它字体。
+    let faceCss = '';
+    try {
+      const blocks = css.match(/@font-face\s*\{[\s\S]*?\}/g) || [];
+      for (const b of blocks) { if (/font-cxsecret/i.test(b)) { faceCss = b; break; } }
+    } catch (e) {}
+    const srcCss = faceCss || css;
+
+    let m = srcCss.match(/base64,([\w\W]+?)['"]/);
+    if (!m) m = srcCss.match(/base64,([A-Za-z0-9+\/=]+)/);   // 有的写法 url(...) 里不加引号
     if (!m) {
       const u = css.match(/url\((['"]?)([^'")]+\.(?:ttf|otf|woff2?))\1\)/i);
       fontFailReason = u && !/^data:/i.test(u[2])
@@ -1521,17 +1590,25 @@
     try { font = typr.parse(arr.buffer || arr); }
     catch (e) { fontFailReason = '字体解析失败：' + (e && e.message); return null; }
 
-    // 打印 cmap 结构，便于判断是哪种子表
-    try {
-      const cmapKeys = Object.keys(font.cmap || {}).filter(k => k !== 'tables');
-      const fmts = ((font.cmap && font.cmap.tables) || []).map(t => t && t.format).join(',');
-      log(`字体解密：cmap 表 [${cmapKeys.join(',') || '无'}]，子表格式 [${fmts || '无'}]`);
-    } catch (e) {}
+    // cmap：Typr 有时整张表都没解出来，这时自己从二进制里解析一遍
+    let cmapTables = (font.cmap && font.cmap.tables) || [];
+    try { log(`字体解密：Typr 解析出的表 [${Object.keys(font).join(',')}]`); } catch (e) {}
+    if (!cmapTables.length) {
+      const own = parseCmapFromBuffer(arr);
+      if (own) {
+        cmapTables = own;
+        log(`字体解密：Typr 没解出 cmap，已自行从二进制解析出 ${own.length} 个子表（格式 ${own.map(t => t.format).join(',')}，平台 ${own.map(t => 'p' + t.platformID + 'e' + t.encodingID).join(',')}）`, 'warn');
+      }
+    }
+    if (!cmapTables.length) {
+      fontFailReason = '字体里没有可用的 cmap 表（Typr 与自研解析都没取到）';
+      return null;
+    }
 
     const map = {};
     let glyphCnt = 0, sampleH = '';
     for (let cp = 19968; cp < 40870; cp++) {
-      const g = glyphForCode(font, cp);
+      const g = glyphForCode(cmapTables, cp);
       if (!g) continue;
       glyphCnt++;
       try {
@@ -3071,7 +3148,7 @@
       bankQueryText, queryFreeBank, queryFreeBank2, isBankGarbage, BANK_AD_RE, refreshQuestion, recentClicks, questionReport,
       getPageFn, hiddenAnswerLetters, nativeClick,
       decodeFontObfuscation, ensureTypr, ensureMd5, ensureFontTable, buildFontMap, submitOnce,
-      transcribeEncrypted, glmTranscribeRequest, parseTranscription, glyphInTable, glyphForCode
+      transcribeEncrypted, glmTranscribeRequest, parseTranscription, glyphInTable, glyphForCode, parseCmapFromBuffer
     };
   } catch (e) {}
 

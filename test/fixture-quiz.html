@@ -362,6 +362,37 @@
         dbg.glyphInTable(t6, 0x42) === 8 && dbg.glyphInTable(t6, 0x50) === 0);
       ok('glyphForCode 会遍历所有子表（不依赖 Typr 的平台编码偏好）',
         dbg.glyphForCode({ cmap: { tables: [{ format: 4 }, t12] } }, 0x4E05) === 10);
+
+      // ---------- O. 自研 cmap 解析（Typr 整张 cmap 都没解出时的兜底） ----------
+      (function () {
+        // 手工拼一个最小 TTF：只有一张 cmap(format12, p3e10) 表
+        const b = new Uint8Array(68);
+        const dv = new DataView(b.buffer);
+        dv.setUint32(0, 0x00010000);            // sfnt version
+        dv.setUint16(4, 1);                     // numTables
+        b[12] = 0x63; b[13] = 0x6d; b[14] = 0x61; b[15] = 0x70;   // tag 'cmap'
+        dv.setUint32(20, 28);                   // table offset
+        dv.setUint32(24, 40);                   // table length
+        dv.setUint16(28, 0);                    // cmap version
+        dv.setUint16(30, 1);                    // numTables
+        dv.setUint16(32, 3);                    // platformID
+        dv.setUint16(34, 10);                   // encodingID
+        dv.setUint32(36, 12);                   // subtable offset（相对 cmap）
+        dv.setUint16(40, 12);                   // format 12
+        dv.setUint32(44, 28);                   // length
+        dv.setUint32(48, 0);                    // language
+        dv.setUint32(52, 1);                    // nGroups
+        dv.setUint32(56, 0x4E00);               // startCharCode
+        dv.setUint32(60, 0x4E10);               // endCharCode
+        dv.setUint32(64, 5);                    // startGlyphID
+        const tabs = dbg.parseCmapFromBuffer(b);
+        ok('parseCmapFromBuffer 能从字体二进制里解析出 cmap format12',
+          !!(tabs && tabs.length === 1 && tabs[0].format === 12),
+          JSON.stringify(tabs && tabs.map(t => t.format)));
+        ok('parseCmapFromBuffer 解析出的表能查到正确字形', !!(tabs && dbg.glyphInTable(tabs[0], 0x4E05) === 10));
+        ok('parseCmapFromBuffer 记录了平台/编码（p3e10）',
+          !!(tabs && tabs[0].platformID === 3 && tabs[0].encodingID === 10));
+      })();
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }
