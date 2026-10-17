@@ -230,6 +230,16 @@
       ok('题目结构报告包含关键判据（aria / li.class / 隐藏答案框 / 题块 HTML）',
         /aria-checked/.test(rep) && /li\.class/.test(rep) && /隐藏答案框/.test(rep) && /题块 HTML/.test(rep),
         'len=' + rep.length);
+
+      // ---------- J. 题库广告占位过滤（参考满分助手 2.1.6 的规则） ----------
+      ok('广告占位答案被识别为「未收录」',
+        dbg.isBankGarbage('李恒雅奋力撰写中...🖊(未搜索到答案)') === true
+        && dbg.isBankGarbage('请关注公众号获取完整答案') === true
+        && dbg.isBankGarbage('本题答案在付费题库中，购买后可查看') === true);
+      ok('正常答案不会被误杀',
+        dbg.isBankGarbage('黑格尔的辩证法#费尔巴哈的唯物论') === false
+        && dbg.isBankGarbage('人文主义') === false
+        && dbg.isBankGarbage('正确') === false);
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }

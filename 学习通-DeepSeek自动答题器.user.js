@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.4.1
-// @description  学习通(超星)自动答题。v3.4.1 修复「🔌 测试题库」因未启动就直接返回"已停止"、根本没发请求的 bug（这也是上一版题库探测全失败的真正原因）。v3.4.0 题库失败原因逐条可见 + 多选防连点/节点失效/整题选中态签名，选不上时自动导出该题 HTML 到剪贴板。v3.3.0 题库优先（本地/自定义/免费公开），查不到才用 AI。
+// @version      3.5.0
+// @description  学习通(超星)自动答题。v3.5.0 按参考脚本（满分助手 2.1.6）的真实搜题逻辑重做题库接入：主源一之题库 cx.icodef.com（过滤"李恒雅/公众号/未搜索到答案"等广告占位答案）+ 备用免费源 free4，查询间隔按实测降到 2s，并修复「🔌 测试题库」未启动就返回已停止、根本没发请求的 bug。查不到才用 DeepSeek；架构不变。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -57,11 +57,15 @@
       'https://cx.icodef.com/wyn-nb?v=4',
       'http://cx.icodef.com/wyn-nb?v=4'
     ],
-    // 该免费接口有「1 并发」限制，必须严格串行 + 留间隔，否则立刻返回流控
-    BANK_MIN_INTERVAL: 4000,
+    // 该免费接口有「1 并发」限制，必须串行 + 留间隔。实测：0ms 连发第 3 条就开始流控，
+    // 1.5~2.5s 间隔连续 4 条无流控，所以取 2s（比原来的 4s 快一倍）。
+    BANK_MIN_INTERVAL: 2000,
     BANK_TIMEOUT: 12000,
-    BANK_RATE_BACKOFF: 10000,       // 被流控后的冷却时间(ms)
+    BANK_RATE_BACKOFF: 8000,        // 被流控后的冷却时间(ms)
     BANK_MAX_PER_ROUND: 24,         // 每轮最多查多少题，防止一节课题太多卡太久
+    // 备用免费源（参考满分助手 getAnswer4，免 token；部分网络可用，失败 3 次自动停用）
+    BANK_FREE2_ENABLED: true,
+    BANK_FREE2_URL: 'https://api.muketool.com/cx/v2/query',
     LOCAL_BANK: true,               // 本地题库（自动收录 + 命中，跨学习通子域共享）
     LOCAL_BANK_MAX: 5000,
     BANK_CUSTOM_URL: '',            // 自定义题库地址（兼容 POST /api/search 协议）
@@ -425,6 +429,13 @@
           log('  这是「请求层面」的失败，不是没收录。请检查：浏览器能打开 https://cx.icodef.com 吗？Tampermonkey 是否拦截了跨域？', 'warn');
         }
       }
+    }
+    if (CONFIG.BANK_FREE2_ENABLED) {
+      log('  备用免费源：' + CONFIG.BANK_FREE2_URL);
+      const r2 = await queryFreeBank2({ title: probe, type: '单选题' });
+      log(r2 && r2.answer
+        ? `备用源可用（${r2.src}）：${r2.answer.slice(0, 60)}`
+        : `备用源不可用：${(r2 && r2.reason) || '未知'}（部分网络不可达，属正常）`, (r2 && r2.answer) ? 'ok' : 'warn');
     }
   }
 
@@ -1014,7 +1025,12 @@
     return t.trim().slice(0, 120);
   }
 
-  // ---------- 免费公开题库：网课小助手（1 并发限制，必须串行 + 限速） ----------
+  // 题库返回的「广告/占位」内容不是答案，要当未收录处理。
+  // 参考实现（满分助手）也在过滤这几个词：李恒雅/一之/公众号/叛逆。
+  const BANK_AD_RE = /叛逆|公众号|李恒雅|一之|未搜索到答案|忙不过来|触发流控|付费题库|购买后|卡密/;
+  function isBankGarbage(s) { return BANK_AD_RE.test(String(s || '')); }
+
+  // ---------- 免费公开题库：一之题库（cx.icodef.com，1 并发限制，必须串行 + 限速） ----------
   // 返回 { answer, src } 命中 / { reason } 未命中，reason 用来区分「没这道题」和「请求失败」
   // opts.ignoreRunning：手动「🔌 测试题库」时还没点启动，running 是 false，
   // 不能因为没启动就直接返回「任务已停止」——那样根本没发出请求（v3.4.0 就是栽在这）。
@@ -1031,11 +1047,16 @@
       if (!ignoreRunning && !running) return { reason: '任务已停止' };
       bankLastCall = Date.now();
       try {
-        // 注意：不要手工设置 Referer。Tampermonkey 对部分请求头有限制，
-        // 带上它可能导致整个请求被拒 —— 这是上一版「题库全部查不到」的重点怀疑对象。
+        // 参考实现会带随机 X-Forwarded-For / X-Real-IP（实测并不能绕过流控，
+        // 但保持和已知可用实现一致的请求形态，兼容性更好）。
+        const ip = [1, 2, 3, 4].map(() => Math.floor(Math.random() * 254) + 1).join('.');
         const r = await gmRequest({
           method: 'POST', url, timeout: CONFIG.BANK_TIMEOUT,
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Forwarded-For': ip,
+            'X-Real-IP': ip
+          },
           data: JSON.stringify({ question })
         });
         const raw = String((r && r.responseText) || '');
@@ -1043,7 +1064,11 @@
         let j;
         try { j = JSON.parse(raw); }
         catch (e) { lastReason = '响应非 JSON：' + raw.slice(0, 60).replace(/\s+/g, ' '); continue; }
-        if (j.code === 1 && j.data) return { answer: String(j.data), src: '网课小助手' };
+        if (j.code === 1 && j.data) {
+          const txt = String(j.data);
+          if (isBankGarbage(txt)) return { reason: '未收录(广告占位)' };
+          return { answer: txt, src: '一之题库' };
+        }
         if (j.code === -2) {
           bankCooldownUntil = Date.now() + CONFIG.BANK_RATE_BACKOFF;
           return { reason: '流控(code:-2)' };
@@ -1055,6 +1080,35 @@
       }
     }
     return { reason: lastReason };
+  }
+
+  // ---------- 备用免费源：muketool（参考 getAnswer4） ----------
+  let bank2FailStreak = 0;
+  async function queryFreeBank2(q) {
+    if (!CONFIG.BANK_FREE2_ENABLED) return { reason: '备用源已关闭' };
+    if (bank2FailStreak >= 3) return { reason: '备用源连续失败已停用' };
+    try {
+      const r = await gmRequest({
+        method: 'POST', url: CONFIG.BANK_FREE2_URL, timeout: CONFIG.BANK_TIMEOUT,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ question: bankQueryText(q), type: typeToInt(q.type) })
+      });
+      const raw = String((r && r.responseText) || '');
+      if (r && r.status && r.status !== 200) { bank2FailStreak++; return { reason: 'HTTP ' + r.status }; }
+      let j;
+      try { j = JSON.parse(raw); }
+      catch (e) { bank2FailStreak++; return { reason: '响应非 JSON：' + raw.slice(0, 40).replace(/\s+/g, ' ') }; }
+      bank2FailStreak = 0;
+      if (j.code === 1 && j.data) {
+        const txt = String(j.data);
+        if (isBankGarbage(txt)) return { reason: '未收录(广告占位)' };
+        return { answer: txt, src: 'free4' };
+      }
+      return { reason: '未收录' };
+    } catch (e) {
+      bank2FailStreak++;
+      return { reason: (e && e.message) || '网络错误' };
+    }
   }
 
   // ---------- 统一检索入口 ----------
@@ -1113,7 +1167,17 @@
       } else if (/流控/.test(reason)) {
         log(`第 ${q.index} 题 题库流控，冷却 ${Math.round(CONFIG.BANK_RATE_BACKOFF / 1000)}s…`, 'warn');
       } else {
-        log(`第 ${q.index} 题 题库未收录（${reason}），交给 AI`);
+        // 主源是通的、只是没这道题（或返回广告占位）→ 再试一下备用免费源
+        let r2 = null;
+        if (CONFIG.BANK_FREE2_ENABLED) {
+          r2 = await queryFreeBank2(q);
+          if (r2 && r2.answer) {
+            found.set(q.index, { answer: r2.answer, src: r2.src });
+            log(`第 ${q.index} 题 备用题库命中（${r2.src}）：${r2.answer.slice(0, 45)}`, 'ok');
+            continue;
+          }
+        }
+        log(`第 ${q.index} 题 题库未收录（${reason}${r2 ? '；备用源：' + (r2.reason || '无') : ''}），交给 AI`);
       }
     }
     return found;
@@ -2541,7 +2605,7 @@
       selectedLetters, pendingMulti, retryPendingMulti, multiPlan, qKeyOf,
       normQuestion, bankKey, bankAnswerToArray, mapAnswersToOptions, stripOptionLetter,
       loadLocalBank, saveLocalBank, localBankSize, rememberQuestion, bankLookup, typeToInt,
-      bankQueryText, queryFreeBank, refreshQuestion, recentClicks, questionReport
+      bankQueryText, queryFreeBank, queryFreeBank2, isBankGarbage, BANK_AD_RE, refreshQuestion, recentClicks, questionReport
     };
   } catch (e) {}
 
