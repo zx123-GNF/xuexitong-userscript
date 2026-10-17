@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.6.0
-// @description  学习通(超星)自动答题。v3.6.0 找到并修复贯穿多个版本的真正根因：模拟点击时「合成 click + el.click()」等于连点两次，单选（radio）幂等看不出来，多选（checkbox）则选上又取消 —— 这就是"多选怎么都选不上、单选却正常"。同时：从 li 的 onclick 属性发现页面作答函数（addChoice/addMultipleChoice）直接调用、识别新样式选项字母 span.num_option_dx[data]、用隐藏答案框 input[name=answer<qid>] 作为选中依据。题库与 AI 架构不变。
+// @version      3.7.0
+// @description  学习通(超星)自动答题。v3.7.0 新增字体混淆解密：学习通用自定义字体把题干渲染成随机码位（读出来是乱码），现在用页面内嵌字体算字形轮廓 + md5 查映射表还原真字（纯查表、不用 AI），还原后再走「题库 → AI」，题库命中率因此大幅提升。v3.6.0 根治多选选不上（模拟点击重复派发导致 checkbox 抵消）。v3.5.0 按满分助手真实搜题逻辑接入一之题库+备用 free4。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -16,6 +16,7 @@
 // @connect      api.tikuhai.com
 // @connect      tk.enncy.cn
 // @connect      api.muketool.com
+// @connect      www.forestpolice.org
 // @connect      cdn.staticfile.org
 // @connect      cdn.bootcdn.net
 // @connect      cdnjs.cloudflare.com
@@ -70,6 +71,21 @@
     LOCAL_BANK_MAX: 5000,
     BANK_CUSTOM_URL: '',            // 自定义题库地址（兼容 POST /api/search 协议）
     BANK_CUSTOM_KEY: '',            // 自定义题库密钥
+    // ==================== 字体混淆解密（v3.7.0）====================
+    // 学习通把题干/选项的文字用自定义字体渲染成随机码位（font-cxsecret），
+    // 直接读 textContent 就是乱码，题库和 AI 都拿不到真实题意。
+    // 解法（与「满分助手」同源）：用页面内嵌的字体算出每个码位的字形轮廓，
+    // 取其 md5 前 24 位去映射表里查真字 —— 纯查表，不消耗 AI。
+    FONT_DECODE_ENABLED: true,
+    TYPR_URLS: [
+      'https://cdn.jsdelivr.net/npm/typr.js@1.0.0/index.js',
+      'https://cdn.jsdelivr.net/gh/photopea/Typr.js@master/src/Typr.js',
+      'https://cdn.jsdelivr.net/gh/photopea/Typr.js@master/src/Typr.U.js'
+    ],
+    MD5_URLS: [
+      'https://cdn.staticfile.org/blueimp-md5/2.19.0/js/md5.min.js'
+    ],
+    FONT_TABLE_URL: 'https://www.forestpolice.org/ttf/2.0/table.json',
     // html2canvas 截图库 CDN（按顺序尝试，国内优先）
     H2C_URLS: [
       'https://cdn.staticfile.org/html2canvas/1.4.1/html2canvas.min.js',
@@ -1216,6 +1232,169 @@
     return missing.length ? { plan, missing } : null;
   }
 
+  /* ==================== 字体混淆解密（v3.7.0）====================
+   * 学习通（超星）把题干/选项的汉字用自定义字体渲染成随机码位，DOM 里读出来是
+   * 「扞扚扖扝」这种乱码。题库按文本检索因此永远查不到，AI 也读不懂题干。
+   *
+   * 解法与「满分助手」同源，纯查表、不消耗 AI：
+   *   1) 页面 <style> 里内嵌着 @font-face 的 base64 字体；
+   *   2) 用 Typr 解析这份字体，对 CJK 区每个码位算出字形轮廓；
+   *   3) 轮廓 JSON 取 md5 前 24 位 → 查映射表 → 得到真实汉字；
+   *   4) 把 .font-cxsecret 元素的文字替换成真字，并移除该类名。
+   * 这样后续 collectQuestions 拿到的就是真实文本，题库和 AI 都能正常用。
+   */
+  let typrPromise = null, md5Promise = null, fontTableData = null, fontTablePromise = null;
+  const fontDecodeTried = new WeakSet();
+
+  async function ensureMd5() {
+    if (typeof md5 === 'function') return md5;
+    if (md5Promise) return md5Promise;
+    md5Promise = (async () => {
+      for (const url of CONFIG.MD5_URLS) {
+        try {
+          const code = await gmGetText(url);
+          if (code) { try { (0, eval)(code); } catch (e) {} }
+        } catch (e) {}
+        if (typeof md5 === 'function') return md5;
+      }
+      return null;
+    })();
+    return md5Promise;
+  }
+
+  async function ensureTypr() {
+    if (typeof Typr !== 'undefined' && Typr && Typr.parse && Typr.U) return Typr;
+    if (typrPromise) return typrPromise;
+    typrPromise = (async () => {
+      // a) npm 打包版：自带 Typr.U，55KB 一步到位
+      try {
+        const code = await gmGetText(CONFIG.TYPR_URLS[0]);
+        if (code) { try { (0, eval)(code); } catch (e) {} }
+      } catch (e) {}
+      if (typeof Typr !== 'undefined' && Typr && Typr.parse && Typr.U) return Typr;
+      // b) 源码版：Typr.js 先定义 parse，Typr.U.js 再挂上 U
+      for (const url of CONFIG.TYPR_URLS.slice(1)) {
+        try {
+          const code = await gmGetText(url);
+          if (code) { try { (0, eval)(code); } catch (e) {} }
+        } catch (e) {}
+      }
+      return (typeof Typr !== 'undefined' && Typr && Typr.parse && Typr.U) ? Typr : null;
+    })();
+    return typrPromise;
+  }
+
+  async function ensureFontTable() {
+    if (fontTableData) return fontTableData;
+    if (fontTablePromise) return fontTablePromise;
+    fontTablePromise = (async () => {
+      // 先读本地缓存（7 天有效），避免每次都拉 355KB
+      try {
+        const raw = storeGet('ds-font-table', '');
+        if (raw) {
+          const o = JSON.parse(raw);
+          if (o && o.at && o.t && (Date.now() - o.at) < 7 * 864e5) { fontTableData = o.t; return fontTableData; }
+        }
+      } catch (e) {}
+      try {
+        const txt = await gmGetText(CONFIG.FONT_TABLE_URL);
+        if (txt && txt.length > 1000) {
+          const t = JSON.parse(txt);
+          fontTableData = t;
+          try { storeSet('ds-font-table', JSON.stringify({ at: Date.now(), t })); } catch (e) {}
+          return fontTableData;
+        }
+      } catch (e) { log('字体映射表下载失败：' + e.message, 'warn'); }
+      return null;
+    })();
+    return fontTablePromise;
+  }
+
+  // 对当前所有 frame 做一次字体解密；返回成功解密的元素数
+  async function decodeFontObfuscation(docs) {
+    if (!CONFIG.FONT_DECODE_ENABLED) return 0;
+    // 只有真的存在混淆元素才去加载依赖（避免每页都拉 CDN）
+    const pending = [];
+    docs.forEach(doc => {
+      try {
+        if (fontDecodeTried.has(doc)) return;
+        const els = doc.querySelectorAll('.font-cxsecret,[class*="cxsecret"]');
+        if (els.length) pending.push({ doc, els: Array.from(els) });
+        else fontDecodeTried.add(doc);
+      } catch (e) {}
+    });
+    if (!pending.length) return 0;
+
+    const typr = await ensureTypr();
+    const md5fn = await ensureMd5();
+    if (!typr || !md5fn) {
+      log('字体解密依赖加载失败（Typr/md5），本页改走截图识别', 'warn');
+      pending.forEach(p => fontDecodeTried.add(p.doc));
+      return 0;
+    }
+    const table = await ensureFontTable();
+    if (!table) {
+      log('字体映射表不可用，本页改走截图识别', 'warn');
+      pending.forEach(p => fontDecodeTried.add(p.doc));
+      return 0;
+    }
+
+    let total = 0;
+    for (const p of pending) {
+      try {
+        // 1) 从 <style> 里抠出内嵌字体的 base64
+        let css = '';
+        const styles = p.doc.querySelectorAll('style');
+        for (const st of styles) {
+          const t = st.textContent || '';
+          if (t.indexOf('font-cxsecret') !== -1) { css = t; break; }
+        }
+        const m = css && css.match(/base64,([\w\W]+?)['"]/);
+        if (!m) { fontDecodeTried.add(p.doc); continue; }
+        const b64 = m[1].replace(/\s+/g, '');
+        const bin = atob(b64);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        const font = typr.parse(arr.buffer || arr);
+
+        // 2) 建立「混淆码位 → 真实汉字」映射（CJK 统一表意文字区）
+        const map = {};
+        for (let cp = 19968; cp < 40870; cp++) {
+          let g = 0;
+          try { g = typr.U.codeToGlyph(font, cp); } catch (e) { g = 0; }
+          if (!g) continue;
+          try {
+            const path = typr.U.glyphToPath(font, g);
+            const h = md5fn(JSON.stringify(path)).slice(24);
+            const real = table[h];
+            if (typeof real === 'number' && real > 0) map[cp] = real;
+          } catch (e) {}
+        }
+        const keys = Object.keys(map);
+        if (!keys.length) { fontDecodeTried.add(p.doc); continue; }
+
+        // 3) 替换文本并去掉混淆类名，让后续识别拿到真字
+        p.els.forEach(el => {
+          let html = el.innerHTML || '';
+          keys.forEach(k => {
+            const from = String.fromCharCode(Number(k));
+            if (html.indexOf(from) === -1) return;
+            html = html.split(from).join(String.fromCharCode(map[k]));
+            total++;
+          });
+          el.innerHTML = html;
+          try { el.classList.remove('font-cxsecret'); } catch (e) {}
+          try { el.classList.remove('fontLabel'); } catch (e) {}
+        });
+        fontDecodeTried.add(p.doc);
+      } catch (e) {
+        fontDecodeTried.add(p.doc);
+      }
+    }
+    if (total) log(`字体混淆已解密（${total} 处字符替换），题干现在是真实文字`, 'ok');
+    return total;
+  }
+
   /* ---------------------------- 执行作答 ---------------------------- */
   // 把「答案数组」映射成选项对象。题库答案和 AI 答案共用这一套：
   //   字母（A / A#B）→ 按字母
@@ -2359,6 +2538,8 @@
       if (++guard > 3000) { log('安全阀触发：循环次数异常，已停止', 'warn'); break; }
       setStatus(`扫描页面（已推进 ${sections} 步）…`);
       const docs = getAllDocs();
+      // 先把字体混淆解开，否则题干是乱码，题库必然查不到、AI 也读不懂
+      try { await decodeFontObfuscation(docs); } catch (e) {}
       await scrollAll(docs);
       await handlePopups(docs, { wait: false });
 
@@ -2658,7 +2839,8 @@
       normQuestion, bankKey, bankAnswerToArray, mapAnswersToOptions, stripOptionLetter,
       loadLocalBank, saveLocalBank, localBankSize, rememberQuestion, bankLookup, typeToInt,
       bankQueryText, queryFreeBank, queryFreeBank2, isBankGarbage, BANK_AD_RE, refreshQuestion, recentClicks, questionReport,
-      getPageFn, hiddenAnswerLetters, nativeClick
+      getPageFn, hiddenAnswerLetters, nativeClick,
+      decodeFontObfuscation, ensureTypr, ensureMd5, ensureFontTable
     };
   } catch (e) {}
 

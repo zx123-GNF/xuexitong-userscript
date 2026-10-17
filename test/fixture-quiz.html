@@ -337,6 +337,10 @@
       ok('题7：一次 clickOption 只触发 1 次点击（旧版会触发 2 次把 checkbox 抵消）',
         q7.options[0].li.dataset.clicks === '1', 'clicks=' + q7.options[0].li.dataset.clicks);
       ok('题7：点击后 A 选中', dbg.optionSelected(q7.options[0]) === true);
+
+      // ---------- L. 字体混淆解密：无混淆字体时必须安全跳过、不拉外部依赖 ----------
+      const dec = await dbg.decodeFontObfuscation(dbg.getAllDocs());
+      ok('字体解密：页面无 .font-cxsecret 时安全返回 0（不会去加载 CDN）', dec === 0, 'ret=' + dec);
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }

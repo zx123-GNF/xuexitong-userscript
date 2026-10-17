@@ -4,7 +4,54 @@
 
 ---
 
-## v3.6.0 —（当前最新）
+## v3.7.0 —（当前最新）
+
+**新增字体混淆解密：题干不再是乱码，题库与 AI 都能拿到真实题意。**
+
+### 背景
+
+用户提供的真实页面片段显示：题干 DOM 是 `【多选题】扞扚扖扝手段扗以扜讲扙内容变得生动?`，
+外层 `<div class="clearfix font-cxsecret fontLabel">`。学习通把真实汉字用自定义字体渲染成随机码位，
+直接读 `textContent` 只能拿到乱码 —— 这就是「题库按文本一条都查不到」的根本原因（除了接口本身的 bug）。
+
+### 参考实现（满分助手 2.1.6 的 `decode()`）
+
+不是 OCR，而是**字形轮廓 hash 查表**：
+
+```js
+font  = Typr.parse(页面内嵌的 base64 字体)
+table = JSON.parse(GM_getResourceText("ttf"))      // https://www.forestpolice.org/ttf/2.0/table.json
+for (cp = 0x4E00 .. 0x9FA5) {                       // 遍历 CJK 区
+  g = Typr.U.codeToGlyph(font, cp)
+  p = Typr.U.glyphToPath(font, g)
+  map[cp] = table[md5(JSON.stringify(p)).slice(24)]  // 轮廓 md5 → 真字
+}
+把 .font-cxsecret 里的字替换成真字，再移除类名
+```
+
+### 本版实现
+
+- 运行时按需加载依赖（不写死在 `@require`，加载失败可降级）：
+  - `https://cdn.jsdelivr.net/npm/typr.js@1.0.0/index.js`（55KB，自带 `Typr.U`）
+  - 备选 `photopea/Typr.js` 的 `src/Typr.js` + `src/Typr.U.js`
+  - `https://cdn.staticfile.org/blueimp-md5/2.19.0/js/md5.min.js`
+- 映射表 `table.json`（355KB / 约 2 万条）首次使用时下载，缓存 7 天（存 `ds-font-table`）。
+- 主循环每次扫描前调用 `decodeFontObfuscation()`；**只在真的存在 `.font-cxsecret` 元素时才去加载依赖**，
+  没有混淆字符的页面零开销。
+- 解码成功的元素会移除 `font-cxsecret` 类名，`collectQuestions` 之后拿到的就是真字，
+  `encrypted` 不再为真 → 走正常的「题库 → AI」文本流程。
+- 任何一步失败（CDN 不通 / 表下载失败 / 字体解不出字）都会**安全降级**回原来的截图识别路径，并打日志说明原因。
+- 新增 `@connect www.forestpolice.org`。
+
+### 验证
+
+- 用 Node 跑通依赖链冒烟测试：`Typr.parse` 解析真实 TTF ✓、`codeToGlyph`/`glyphToPath` 产出轮廓 ✓、
+  `md5("abc")` 结果正确 ✓。（npm 包末尾的 `module.exports` 在沙箱里会抛错，已用 try/catch 吞掉，
+  `Typr` 在此之前已完整定义。）
+- 回归测试 84 → **85 项**，新增「页面无混淆字体时安全返回 0、不加载 CDN」。
+
+---
+## v3.6.0 —（上一版）
 
 **找到并根治了"多选题怎么都选不上"的真正根因。**
 
