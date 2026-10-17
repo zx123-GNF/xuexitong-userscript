@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.8.3
-// @description  学习通(超星)自动答题。v3.8.3 修重复提交（提交后页面重渲染导致题目签名变化，去重失效；改用页面级标记），并对"多选把全部选项都选中"给出提醒。完整链路：字体hash解密 →（失败）视觉转写文字 → 题库检索 → 文本 AI → 点击作答。v3.6.0 根治多选选不上。
+// @version      3.8.4
+// @description  学习通(超星)自动答题。v3.8.4 修手动拾取失效后点错位置：拾取存的是带 :nth-of-type 的位置路径，任务点标签从 2 个变成 3 个后旧路径指向了「2 视频」，脚本就去点了章节测验前面那个位置；现在手动拾取会校验文字，文字不对自动忽略并退回自动识别。同时把每页判定顺序做成显式决策日志：有未完成任务点标签 → 先点它；没有 → 找「下一节」；都没有 → 判定课程结束。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -2599,12 +2599,21 @@
       return c;
     };
 
-    // 0) 手动拾取的选择器：优先级最高
+    // 0) 手动拾取的选择器：优先级最高，但文字必须仍然是「下一节」之类的按钮
     if (CONFIG.NEXT_BTN_PICKED) {
       docs.forEach(doc => {
         let el = null;
         try { el = doc.querySelector(CONFIG.NEXT_BTN_PICKED); } catch (e) {}
-        if (el && !rejectReason(el, doc, { allowEmpty: true })) {
+        if (!el) return;
+        const t = cleanText(el.textContent || '');
+        if (nextTextRank(t) === 99) {
+          if (!pickWarned.next) {
+            pickWarned.next = true;
+            log(`手动拾取的「下一节」已失效（现在指向「${t.slice(0, 12)}」），已忽略并改用自动识别。建议点「清除所有手动拾取」`, 'warn');
+          }
+          return;
+        }
+        if (!rejectReason(el, doc, { allowEmpty: true })) {
           const c = add(el, doc, '手动拾取');
           if (c) c.prio = -100;
         }
@@ -2682,6 +2691,8 @@
    */
   let visitedTabs = new Set();     // 本小节内已经点过的任务点标签，防止任务点之间来回横跳
   function resetVisitedTabs() { visitedTabs = new Set(); }
+  // 手动拾取只警告一次，避免刷屏
+  const pickWarned = { tab: false, next: false };
 
   // 当前正在展示的任务点标签（带 active/cur 高亮，或 aria-selected）
   function isActiveTab(el) {
@@ -2723,17 +2734,27 @@
       out.push({ el, doc, t, why: '任务点标签', prio, key: t.replace(/\s+/g, '') });
     };
 
-    // 0) 手动拾取（放宽文本要求，但“当前打开的任务点”仍然跳过，否则会死循环）
+    // 0) 手动拾取：优先级最高，但【必须校验文字仍然是任务点标签】。
+    //    手动拾取存的是 CSS 路径（常带 :nth-of-type），标签数量一变就会指到别的标签
+    //    （实测：任务点从「2 视频 / 3 章节测验」变成「1 学习目标 / 2 视频 / 3 章节测验」后，
+    //     旧路径指到了「2 视频」，于是脚本去点了章节测验前面那个位置）。
     if (CONFIG.TASK_TAB_PICKED) {
       docs.forEach(doc => {
         let el = null;
         try { el = doc.querySelector(CONFIG.TASK_TAB_PICKED); } catch (e) {}
-        if (el && !isOwnUI(el) && isVisible(el) && !isDisabled(el) && !isActiveTab(el) && !seen.has(el)) {
+        if (!el) return;
+        const t = cleanText(el.textContent || '');
+        const looksTab = !!t && t.length <= 14 && CONFIG.TASK_TAB_TEXT.some(k => t.includes(k));
+        if (!looksTab) {
+          if (!pickWarned.tab) {
+            pickWarned.tab = true;
+            log(`手动拾取的「章节测验」已失效（现在指向「${t.slice(0, 12)}」），已忽略并改用自动识别。建议点「清除所有手动拾取」`, 'warn');
+          }
+          return;
+        }
+        if (!isOwnUI(el) && isVisible(el) && !isDisabled(el) && !isActiveTab(el) && !seen.has(el)) {
           seen.add(el);
-          out.push({
-            el, doc, t: cleanText(el.textContent) || '任务点', why: '手动拾取的章节测验标签',
-            prio: -100, key: 'picked:' + CONFIG.TASK_TAB_PICKED
-          });
+          out.push({ el, doc, t, why: '手动拾取的章节测验标签', prio: -100, key: 'picked:' + CONFIG.TASK_TAB_PICKED });
         }
       });
     }
@@ -2897,6 +2918,8 @@
             continue;
           }
           log('任务点标签点了都没反应，改为找“下一节”', 'warn');
+        } else {
+          log('本页决策：没有未完成的任务点标签 → 再去找「下一节」');
         }
       }
 
@@ -2929,7 +2952,7 @@
       } else {
         noNextRetries++;
         if (noNextRetries >= CONFIG.NO_NEXT_RETRIES) {
-          log('本页无题目，也找不到下一节按钮，判定本课程已结束，停在当前页', 'ok');
+          log('本页决策：既没有任务点标签，也没有「下一节」→ 判定本课程已结束，停在当前页', 'ok');
           break;
         }
         log(`未识别到题目，也未找到下一节按钮（${noNextRetries}/${CONFIG.NO_NEXT_RETRIES}）｜${scopeWhy}，滚动后重试…`, 'warn');

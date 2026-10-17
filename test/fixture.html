@@ -44,8 +44,9 @@
   </div>
   <a href="javascript:;" id="topRightNext">下一节</a>
   <div class="ans-job-list" id="jobList">
-    <span class="jobTab active" id="tabVideo">1 视频</span>
-    <span class="jobTab" id="tabQuiz">2 章节测验</span>
+    <span class="jobTab" id="tabGoals">1 学习目标</span>
+    <span class="jobTab active" id="tabVideo">2 视频</span>
+    <span class="jobTab" id="tabQuiz">3 章节测验</span>
   </div>
   <iframe id="frame" src="module-video.html"></iframe>
   <div id="RESULT">PENDING</div>
@@ -172,6 +173,17 @@
       ok('点「2 章节测验」后任务点确实切换了', switched === true);
       ok('任务点指纹发生变化（真的进了答题区）', dbg.taskSignature(dbg.getAllDocs()) !== sigBefore);
       dbg.setRunning(false);
+
+      // ---- 场景 5：手动拾取失效（位置路径指到了别的标签）必须被自动忽略 ----
+      // 真实场景：任务点从「2 视频 / 3 章节测验」变成「1 学习目标 / 2 视频 / 3 章节测验」，
+      // 旧的 :nth-of-type 路径就指到了「2 视频」，脚本会去点章节测验前面那个位置。
+      const savedTabPick = dbg.CONFIG.TASK_TAB_PICKED;
+      dbg.CONFIG.TASK_TAB_PICKED = '#tabGoals';
+      const t5 = dbg.collectTaskTabs(docs);
+      const t5ids = t5.map(x => x.el.id || '(no-id)');
+      ok('手动拾取指向错误标签（1 学习目标）时被忽略', t5ids.indexOf('tabGoals') < 0, t5ids.join(','));
+      ok('忽略失效拾取后仍能自动识别出 tabQuiz', t5ids.indexOf('tabQuiz') > -1, t5ids.join(','));
+      dbg.CONFIG.TASK_TAB_PICKED = savedTabPick;
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }
