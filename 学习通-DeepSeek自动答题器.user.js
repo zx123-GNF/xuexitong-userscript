@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.8.2
-// @description  学习通(超星)自动答题。v3.8.2 修字体解密：Typr 有时整张 cmap 表都解不出来，改成自己从字体二进制里解析 cmap（format 12/4/6），并优先从「font-family 含 font-cxsecret 的 @font-face」取字体（同一 style 里可能有多个字体）。配合 v3.8.0 的视觉转写兜底，构成「字体hash解密 → 视觉转写 → 题库 → 文本AI」。v3.6.0 根治多选选不上。
+// @version      3.8.3
+// @description  学习通(超星)自动答题。v3.8.3 修重复提交（提交后页面重渲染导致题目签名变化，去重失效；改用页面级标记），并对"多选把全部选项都选中"给出提醒。完整链路：字体hash解密 →（失败）视觉转写文字 → 题库检索 → 文本 AI → 点击作答。v3.6.0 根治多选选不上。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -1874,6 +1874,10 @@
           }
           // 记下多选的期望答案：只要没选全，主循环会继续补选
           if (isMulti) multiPlan.set(qKeyOf(q), { letters: targetLetters, tries: 0 });
+          // 多选题把全部选项都选了 —— 可能确实全对，也可能是文本匹配过宽，提醒一下
+          if (isMulti && q.options.length > 2 && picked.length === q.options.length) {
+            log(`第 ${q.index} 题（多选）全部 ${picked.length} 个选项都被选中，请留意答案来源：${sources[q.index] || '?'}`, 'warn');
+          }
           if (isMulti && picked.length < 2) {
             log(`第 ${q.index} 题判定为多选题，但只拿到 1 个答案（${ans.join(',')}），可能漏选，请人工确认`, 'err');
           }
@@ -2532,12 +2536,12 @@
     return true;
   }
 
-  // 同一套题只提交一次（避免"已答完→再检查提交"把同一份卷子点两遍）
-  let lastSubmitSig = '';
+  // 本页只提交一次。用「页面级」标记而不是题目签名：
+  // 提交后页面会重渲染，题干文本可能变，用签名去重会失效（实测重复提交了两次）。
+  let pageSubmitted = false;
   async function submitOnce(docs, questions) {
-    const sig = (questions || []).map(qKeyOf).join('|').slice(0, 400);
-    if (sig && sig === lastSubmitSig) { log('本节已提交过，跳过重复提交'); return; }
-    if (await autoSubmit(docs)) lastSubmitSig = sig;
+    if (pageSubmitted) { log('本页已提交过，跳过重复提交'); return; }
+    if (await autoSubmit(docs)) pageSubmitted = true;
   }
 
   /* ------------- 下一节候选解析（v3.0.0 修复核心） -------------
@@ -2910,7 +2914,7 @@
         if (advanced) {
           sections++;
           resetVisitedTabs();          // 换小节了，任务点标签重新计数
-          lastSubmitSig = '';          // 换小节了，允许重新提交
+          pageSubmitted = false;       // 换小节了，允许重新提交
           if (sections > CONFIG.MAX_SECTIONS) { log('达到最大节数限制，停止', 'warn'); break; }
         } else {
           noNextRetries++;
