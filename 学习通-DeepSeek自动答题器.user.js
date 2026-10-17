@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.4.0
-// @description  学习通(超星)自动答题。v3.4.0 修复两个问题：① 题库"全都查不到"——去掉会被 Tampermonkey 拒绝的 Referer 头、题干清洗后再查、并把失败原因（网络/HTTP/流控/未收录）逐条打进日志、连续失败直接降级 AI；② 多选"点了没反应"——点前防连点抵消、每次点击前重新采集节点（应对 JS 重渲染导致节点失效）。v3.3.0 新增题库优先（本地/自定义/免费公开），查不到才用 AI。
+// @version      3.4.1
+// @description  学习通(超星)自动答题。v3.4.1 修复「🔌 测试题库」因未启动就直接返回"已停止"、根本没发请求的 bug（这也是上一版题库探测全失败的真正原因）。v3.4.0 题库失败原因逐条可见 + 多选防连点/节点失效/整题选中态签名，选不上时自动导出该题 HTML 到剪贴板。v3.3.0 题库优先（本地/自定义/免费公开），查不到才用 AI。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -414,7 +414,7 @@
     if (CONFIG.BANK_FREE_ENABLED) {
       log('  免费题库地址：' + CONFIG.BANK_FREE_URLS.join(' , '));
       log('  发送题干：' + probe);
-      const r = await queryFreeBank(probe);
+      const r = await queryFreeBank(probe, { ignoreRunning: true });
       const ms = Date.now() - t0;
       if (r && r.answer) {
         log(`免费题库可用（${r.src}）：${r.answer.slice(0, 60)}（${ms}ms）`, 'ok');
@@ -1016,7 +1016,10 @@
 
   // ---------- 免费公开题库：网课小助手（1 并发限制，必须串行 + 限速） ----------
   // 返回 { answer, src } 命中 / { reason } 未命中，reason 用来区分「没这道题」和「请求失败」
-  async function queryFreeBank(question) {
+  // opts.ignoreRunning：手动「🔌 测试题库」时还没点启动，running 是 false，
+  // 不能因为没启动就直接返回「任务已停止」——那样根本没发出请求（v3.4.0 就是栽在这）。
+  async function queryFreeBank(question, opts) {
+    const ignoreRunning = !!(opts && opts.ignoreRunning);
     if (!CONFIG.BANK_FREE_ENABLED) return { reason: '题库已关闭' };
     const now = Date.now();
     if (now < bankCooldownUntil) return { reason: '流控冷却中' };
@@ -1025,7 +1028,7 @@
 
     let lastReason = '未发起请求';
     for (const url of CONFIG.BANK_FREE_URLS) {
-      if (!running) return { reason: '已停止' };
+      if (!ignoreRunning && !running) return { reason: '任务已停止' };
       bankLastCall = Date.now();
       try {
         // 注意：不要手工设置 Referer。Tampermonkey 对部分请求头有限制，
@@ -1303,8 +1306,16 @@
             missing = targetLetters.filter(L => { const o = findOpt(L); return o && !optionSelected(o); });
           }
           log(`${src}第 ${q.index} 题（${q.type || (isMulti ? '多选题' : '单选题')}）已选：${targetLetters.join('、')}`
-            + (missing.length ? `｜警告：${missing.join('、')} 仍未选中（可点 🔬 导出题目 HTML 发给助手）` : ''),
+            + (missing.length ? `｜警告：${missing.join('、')} 仍未选中` : ''),
             missing.length ? 'warn' : 'ok');
+          // 还是没选上：自动把这道题的真实结构导出并复制到剪贴板，省得用户再去找按钮
+          if (missing.length) {
+            try {
+              const rep = questionReport(q);
+              console.log('[DS答题-选不上的题]\n' + rep);
+              log('已自动导出该题结构' + (copyText(rep) ? '并复制到剪贴板，直接粘贴给助手即可' : '（复制失败，请按 F12 看 [DS答题-选不上的题]）'), 'err');
+            } catch (e) {}
+          }
           // 记下多选的期望答案：只要没选全，主循环会继续补选
           if (isMulti) multiPlan.set(qKeyOf(q), { letters: targetLetters, tries: 0 });
           if (isMulti && picked.length < 2) {
@@ -1456,7 +1467,16 @@
       if (await attempt('点字母标记(冒泡)', () => nativeClick(before))) return true;
     }
 
-    // ⑥ 纯 JS 组件的最后兜底：手动同步 aria / class / 隐藏答案框
+    // ⑥ 点选项文字：有些组件把事件绑在内层 span/div 上，点 li 本体不会触发（事件不向下派发）
+    const textEl = (() => {
+      try {
+        const cands = Array.from(li.querySelectorAll('div,span,a,p'));
+        return cands.find(x => cleanText(x.textContent || '').length > 1 && !x.querySelector('input,button')) || null;
+      } catch (e) { return null; }
+    })();
+    if (textEl && textEl !== li && await attempt('点选项文字', () => nativeClick(textEl))) return true;
+
+    // ⑦ 纯 JS 组件的最后兜底：手动同步 aria / class / 隐藏答案框
     try {
       li.setAttribute('aria-checked', 'true');
       li.setAttribute('aria-pressed', 'true');
@@ -2370,6 +2390,32 @@
     log(copyText(report) ? '报告已复制到剪贴板，可直接粘贴给我' : '复制失败，请按 F12 在控制台查看', 'ok');
   }
 
+  // 单道题的结构报告：真实 DOM + 每个选项的判定依据。
+  // 多数「多选选不上」的问题靠这段就能定位，所以选错时会自动导出并复制到剪贴板。
+  function questionReport(q) {
+    const P = [];
+    P.push(`===== 第 ${q.index} 题｜type="${q.type}"｜isMulti=${!!q.isMulti}｜选项数=${q.options.length} =====`);
+    P.push('题干：' + (q.title || '').slice(0, 150));
+    const hid = (q.box && q.box.querySelector) ? q.box.querySelector('input[type=hidden][name^="answer"]') : null;
+    P.push('本题隐藏答案框：' + (hid ? `name=${hid.name} value="${hid.value}"` : '无'));
+    q.options.forEach(o => {
+      const li = o.li || o.el;
+      const sel = o.checked || optionSelected(o);
+      const aria = (li && li.getAttribute) ? li.getAttribute('aria-checked') : null;
+      const ariaP = (li && li.getAttribute) ? li.getAttribute('aria-pressed') : null;
+      const cls = (li && typeof li.className === 'string') ? li.className : '';
+      const dot = (li && li.querySelector) ? li.querySelector('a.before,i.before,span.before,.num_option') : null;
+      P.push(`  ${o.letter}｜判定=${sel}｜input=${o.input ? o.input.type + '(checked=' + o.input.checked + ')' : '无'}`
+        + `｜li.class="${cls}"｜aria-checked=${aria}｜aria-pressed=${ariaP}`
+        + (dot ? `｜标记 <${dot.tagName} class="${dot.className}">` : ''));
+    });
+    let html = '';
+    try { html = q.box.outerHTML || ''; } catch (e) {}
+    P.push('--- 题块 HTML（截断 4000 字）---');
+    P.push(html.slice(0, 4000));
+    return P.join('\n');
+  }
+
   // 🔬 导出题目 HTML：多选还是搞不定时，把真实结构复制出来发给助手
   function dumpQuestionDOM() {
     const docs = getAllDocs();
@@ -2377,27 +2423,7 @@
     const P = [];
     P.push(`时间 ${new Date().toLocaleString()}｜文档数 ${docs.length}｜题目数 ${qs.length}`);
     if (!qs.length) P.push('（当前页面没有扫到题目）');
-    qs.slice(0, 3).forEach(q => {
-      P.push(`\n===== 第 ${q.index} 题｜type="${q.type}"｜isMulti=${!!q.isMulti}｜选项数=${q.options.length} =====`);
-      P.push('题干：' + (q.title || '').slice(0, 150));
-      const hid = (q.box.querySelector && q.box.querySelector('input[type=hidden][name^="answer"]'));
-      P.push('本题隐藏答案框：' + (hid ? `name=${hid.name} value="${hid.value}"` : '无'));
-      q.options.forEach(o => {
-        const li = o.li || o.el;
-        const sel = o.checked || optionSelected(o);
-        const aria = (li && li.getAttribute) ? li.getAttribute('aria-checked') : null;
-        const ariaP = (li && li.getAttribute) ? li.getAttribute('aria-pressed') : null;
-        const cls = (li && typeof li.className === 'string') ? li.className : '';
-        const dot = (li && li.querySelector) ? li.querySelector('a.before,i.before,span.before,.num_option') : null;
-        P.push(`  ${o.letter}｜判定=${sel}｜input=${o.input ? o.input.type + '(checked=' + o.input.checked + ')' : '无'}`
-          + `｜li.class="${cls}"｜aria-checked=${aria}｜aria-pressed=${ariaP}`
-          + (dot ? `｜字母标记 <${dot.tagName} class="${dot.className}">` : ''));
-      });
-      let html = '';
-      try { html = q.box.outerHTML || ''; } catch (e) {}
-      P.push('--- 题块 HTML（截断 4000 字）---');
-      P.push(html.slice(0, 4000));
-    });
+    qs.slice(0, 3).forEach(q => P.push('\n' + questionReport(q)));
     const report = P.join('\n');
     console.log('[DS答题-题目HTML]\n' + report);
     log(`已导出 ${Math.min(qs.length, 3)} 道题的 HTML（${report.length} 字）`);
@@ -2515,7 +2541,7 @@
       selectedLetters, pendingMulti, retryPendingMulti, multiPlan, qKeyOf,
       normQuestion, bankKey, bankAnswerToArray, mapAnswersToOptions, stripOptionLetter,
       loadLocalBank, saveLocalBank, localBankSize, rememberQuestion, bankLookup, typeToInt,
-      bankQueryText, queryFreeBank, refreshQuestion, recentClicks
+      bankQueryText, queryFreeBank, refreshQuestion, recentClicks, questionReport
     };
   } catch (e) {}
 

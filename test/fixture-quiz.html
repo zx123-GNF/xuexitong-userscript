@@ -219,6 +219,17 @@
       ok('本地题库命中的答案能映射回选项',
         (() => { const p = pick(q5, ba(hitV.answer)); return p.length === 1 && p[0].letter === 'A'; })());
       dbg.saveLocalBank({});
+
+      // ---------- I. 题库探测的 running 门禁 + 题目结构报告 ----------
+      dbg.setRunning(false);
+      const rStop = await dbg.queryFreeBank('马克思主义哲学的直接理论来源是', { ignoreRunning: false });
+      ok('未启动任务时题库查询直接返回「任务已停止」，不会发请求',
+        !!(rStop && /停止/.test(rStop.reason || '')), rStop && rStop.reason);
+
+      const rep = dbg.questionReport(q1);
+      ok('题目结构报告包含关键判据（aria / li.class / 隐藏答案框 / 题块 HTML）',
+        /aria-checked/.test(rep) && /li\.class/.test(rep) && /隐藏答案框/.test(rep) && /题块 HTML/.test(rep),
+        'len=' + rep.length);
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }
