@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.8.0
-// @description  学习通(超星)自动答题。v3.8.0 完成「图像→文字→题库→AI」链路：字体解密解不开时，先用视觉模型把题干/选项转写成真文字（只转写不答题），再拿真文字查题库，最后才发文字给 AI；同时给字体解密补上决定性诊断（字体魔数/解析出多少字形/映射命中数/样例 md5）。v3.7.x 字体混淆解密；v3.6.0 根治多选选不上。
+// @version      3.8.1
+// @description  学习通(超星)自动答题。v3.8.1 修字体解密最后一道坎：学习通的字体 cmap 用的是 p3e10/format12，而 Typr 的 codeToGlyph 只认 p0e4/p3e1/p1e0，所以"解析出 0 个中文字形"；改成自己遍历所有 cmap 子表（format 12/4/6/0）查字形。加上 v3.8.0 的视觉转写兜底（图像→文字→题库→AI）。v3.6.0 根治多选选不上。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -1398,7 +1398,66 @@
     return fontTablePromise;
   }
 
-  // 建立「混淆码位 → 真实汉字」映射（只做一次）。失败时把原因记到 fontFailReason。
+  // 在单个 cmap 子表里查码位 → 字形 id
+  function glyphInTable(tab, code) {
+    try {
+      if (!tab || typeof tab.format !== 'number') return 0;
+      if (tab.format === 12) {                       // UCS-4，二分 groups
+        const gs = tab.groups || [];
+        let lo = 0, hi = gs.length - 1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1, g = gs[mid];
+          if (!g) break;
+          if (code < g[0]) hi = mid - 1;
+          else if (code > g[1]) lo = mid + 1;
+          else return g[2] + (code - g[0]);
+        }
+        return 0;
+      }
+      if (tab.format === 4) {                        // BMP 分段表
+        const ec = tab.endCount || [], sc = tab.startCount || [];
+        let lo = 0, hi = ec.length - 1, seg = -1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (code <= ec[mid]) { seg = mid; hi = mid - 1; } else lo = mid + 1;
+        }
+        if (seg < 0 || code < sc[seg]) return 0;
+        if (!tab.idRangeOffset || tab.idRangeOffset[seg] === 0) {
+          return (code + tab.idDelta[seg]) & 0xffff;
+        }
+        const idx = (tab.idRangeOffset[seg] >> 1) + (code - sc[seg]) - ((tab.idRangeOffset.length || 0) - seg);
+        const g = (tab.glyphIdArray || [])[idx];
+        return g ? ((g + tab.idDelta[seg]) & 0xffff) : 0;
+      }
+      if (tab.format === 6) {
+        const arr = tab.glyphIdArray || [];
+        if (code < tab.firstCode || code >= tab.firstCode + arr.length) return 0;
+        return arr[code - tab.firstCode] || 0;
+      }
+      if (tab.format === 0) return (code < (tab.map || []).length) ? (tab.map[code] || 0) : 0;
+    } catch (e) {}
+    return 0;
+  }
+
+  // 遍历字体里【所有】cmap 子表找字形 id。
+  // Typr.U.codeToGlyph 只认 p0e4 / p3e1 / p1e0 三种平台编码；
+  // 学习通这份字体用的是 p3e10（format 12）之类，所以它一个都查不到 —— v3.8.1 修的就是这个。
+  function glyphForCode(font, code) {
+    try {
+      const cmap = font && font.cmap;
+      const tabs = (cmap && cmap.tables) || [];
+      // 优先级：format12（UCS-4）> format4 > format6 > format0
+      const order = [12, 4, 6, 0];
+      for (const fmt of order) {
+        for (const tab of tabs) {
+          if (!tab || tab.format !== fmt) continue;
+          const g = glyphInTable(tab, code);
+          if (g) return g;
+        }
+      }
+    } catch (e) {}
+    return 0;
+  }
   async function buildFontMap(docs) {
     if (fontMapCache) return fontMapCache;
     // 1) 任意一个 frame 的 <style> 里找内嵌字体（字体样式和内容不一定在同一个文档）
@@ -1462,11 +1521,17 @@
     try { font = typr.parse(arr.buffer || arr); }
     catch (e) { fontFailReason = '字体解析失败：' + (e && e.message); return null; }
 
+    // 打印 cmap 结构，便于判断是哪种子表
+    try {
+      const cmapKeys = Object.keys(font.cmap || {}).filter(k => k !== 'tables');
+      const fmts = ((font.cmap && font.cmap.tables) || []).map(t => t && t.format).join(',');
+      log(`字体解密：cmap 表 [${cmapKeys.join(',') || '无'}]，子表格式 [${fmts || '无'}]`);
+    } catch (e) {}
+
     const map = {};
     let glyphCnt = 0, sampleH = '';
     for (let cp = 19968; cp < 40870; cp++) {
-      let g = 0;
-      try { g = typr.U.codeToGlyph(font, cp); } catch (e) { g = 0; }
+      const g = glyphForCode(font, cp);
       if (!g) continue;
       glyphCnt++;
       try {
@@ -3006,7 +3071,7 @@
       bankQueryText, queryFreeBank, queryFreeBank2, isBankGarbage, BANK_AD_RE, refreshQuestion, recentClicks, questionReport,
       getPageFn, hiddenAnswerLetters, nativeClick,
       decodeFontObfuscation, ensureTypr, ensureMd5, ensureFontTable, buildFontMap, submitOnce,
-      transcribeEncrypted, glmTranscribeRequest, parseTranscription
+      transcribeEncrypted, glmTranscribeRequest, parseTranscription, glyphInTable, glyphForCode
     };
   } catch (e) {}
 

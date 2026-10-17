@@ -349,6 +349,19 @@
       ok('parseTranscription 兼容 markdown 代码块包裹', !!(t2 && t2.title === '题干'));
       ok('parseTranscription 无 title 时返回 null', dbg.parseTranscription('{"foo":1}') === null);
       ok('parseTranscription 非 JSON 返回 null', dbg.parseTranscription('完全不是 json') === null);
+
+      // ---------- N. 字体 cmap 查找（v3.8.1：学习通用 format12，Typr 的 codeToGlyph 认不出） ----------
+      const t12 = { format: 12, groups: [[0x4E00, 0x4E10, 5]] };
+      ok('cmap format12：区间内返回正确字形 id', dbg.glyphInTable(t12, 0x4E05) === 10, dbg.glyphInTable(t12, 0x4E05));
+      ok('cmap format12：区间外返回 0', dbg.glyphInTable(t12, 0x4E11) === 0);
+      const t4 = { format: 4, endCount: [0x4E10], startCount: [0x4E00], idDelta: [3], idRangeOffset: [0], glyphIdArray: [] };
+      ok('cmap format4：idRangeOffset=0 走 idDelta',
+        dbg.glyphInTable(t4, 0x4E05) === ((0x4E05 + 3) & 0xffff), dbg.glyphInTable(t4, 0x4E05));
+      const t6 = { format: 6, firstCode: 0x41, glyphIdArray: [7, 8, 9] };
+      ok('cmap format6：按 firstCode 偏移取字形，越界返回 0',
+        dbg.glyphInTable(t6, 0x42) === 8 && dbg.glyphInTable(t6, 0x50) === 0);
+      ok('glyphForCode 会遍历所有子表（不依赖 Typr 的平台编码偏好）',
+        dbg.glyphForCode({ cmap: { tables: [{ format: 4 }, t12] } }, 0x4E05) === 10);
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }
