@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.3.0
-// @description  学习通(超星)章节/作业/测验页面：自动答题。v3.3.0 新增题库优先策略：先查本地题库 → 自定义题库 → 免费公开题库（网课小助手 cx.icodef.com，免 token），命中直接搬答案，查不到才调 DeepSeek 兜底，并把结果自动回写本地题库。v3.0.0 修复误点左侧目录；v3.1.0 优先进入「章节测验」任务点；v3.2.0 重写选项点击逻辑修复多选。
+// @version      3.4.0
+// @description  学习通(超星)自动答题。v3.4.0 修复两个问题：① 题库"全都查不到"——去掉会被 Tampermonkey 拒绝的 Referer 头、题干清洗后再查、并把失败原因（网络/HTTP/流控/未收录）逐条打进日志、连续失败直接降级 AI；② 多选"点了没反应"——点前防连点抵消、每次点击前重新采集节点（应对 JS 重渲染导致节点失效）。v3.3.0 新增题库优先（本地/自定义/免费公开），查不到才用 AI。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -398,22 +398,33 @@
     } catch (e) {}
   }
 
-  // 🔌 题库连通性测试（免费题库有 1 并发限制，这里只发一条）
+  // 🔌 题库连通性测试：把请求/响应/失败原因全部打到日志，便于定位"全都查不到"
   async function testBank() {
     if (!CONFIG.BANK_FREE_ENABLED && !CONFIG.BANK_CUSTOM_URL) {
       log('免费题库和自定义题库都没开，先勾选或填地址', 'warn');
       return;
     }
+    const probe = '马克思主义哲学的直接理论来源是';
     log('测试题库连通性…（免费题库有 1 并发限制）', 'warn');
     const t0 = Date.now();
     if (CONFIG.BANK_CUSTOM_URL) {
-      const r = await queryCustomBank({ title: '马克思主义哲学的直接理论来源是', type: '单选题', options: [] });
+      const r = await queryCustomBank({ title: probe, type: '单选题', options: [] });
       log(r ? '自定义题库可用：' + r.answer.slice(0, 50) : '自定义题库没返回可用答案', r ? 'ok' : 'err');
     }
     if (CONFIG.BANK_FREE_ENABLED) {
-      const r = await queryFreeBank('马克思主义哲学的直接理论来源是');
-      if (r && r.answer) log(`免费题库可用（${r.src}）：${r.answer.slice(0, 50)}（${Date.now() - t0}ms）`, 'ok');
-      else log('免费题库没返回答案：可能未收录 / 流控 / 网络不通，稍后再试', 'err');
+      log('  免费题库地址：' + CONFIG.BANK_FREE_URLS.join(' , '));
+      log('  发送题干：' + probe);
+      const r = await queryFreeBank(probe);
+      const ms = Date.now() - t0;
+      if (r && r.answer) {
+        log(`免费题库可用（${r.src}）：${r.answer.slice(0, 60)}（${ms}ms）`, 'ok');
+      } else {
+        const reason = (r && r.reason) || '未知';
+        log(`免费题库查询失败：${reason}（${ms}ms）`, 'err');
+        if (/网络|超时|HTTP|非 JSON|未发起/.test(reason)) {
+          log('  这是「请求层面」的失败，不是没收录。请检查：浏览器能打开 https://cx.icodef.com 吗？Tampermonkey 是否拦截了跨域？', 'warn');
+        }
+      }
     }
   }
 
@@ -995,34 +1006,52 @@
     } catch (e) { return null; }
   }
 
+  // 发给题库的题干：去掉题号、题型标记，清理空白，限制长度
+  function bankQueryText(q) {
+    let t = cleanText(q.title || '');
+    t = t.replace(/^[0-9０-９]+\s*[、.．]?\s*/, '');
+    t = t.replace(/[（(【\[]\s*(单项选择题|多项选择题|不定项选择题|单选题|多选题|判断题|填空题?|简答题?)\s*[）)】\]]/g, '');
+    return t.trim().slice(0, 120);
+  }
+
   // ---------- 免费公开题库：网课小助手（1 并发限制，必须串行 + 限速） ----------
+  // 返回 { answer, src } 命中 / { reason } 未命中，reason 用来区分「没这道题」和「请求失败」
   async function queryFreeBank(question) {
-    if (!CONFIG.BANK_FREE_ENABLED) return null;
+    if (!CONFIG.BANK_FREE_ENABLED) return { reason: '题库已关闭' };
     const now = Date.now();
-    if (now < bankCooldownUntil) return null;
+    if (now < bankCooldownUntil) return { reason: '流控冷却中' };
     const wait = bankLastCall + CONFIG.BANK_MIN_INTERVAL - now;
     if (wait > 0) await sleep(wait);
 
+    let lastReason = '未发起请求';
     for (const url of CONFIG.BANK_FREE_URLS) {
-      if (!running) return null;
+      if (!running) return { reason: '已停止' };
       bankLastCall = Date.now();
       try {
+        // 注意：不要手工设置 Referer。Tampermonkey 对部分请求头有限制，
+        // 带上它可能导致整个请求被拒 —— 这是上一版「题库全部查不到」的重点怀疑对象。
         const r = await gmRequest({
           method: 'POST', url, timeout: CONFIG.BANK_TIMEOUT,
-          headers: { 'Content-Type': 'application/json', Referer: location.href },
+          headers: { 'Content-Type': 'application/json' },
           data: JSON.stringify({ question })
         });
-        const j = JSON.parse(r.responseText);
+        const raw = String((r && r.responseText) || '');
+        if (r && r.status && r.status !== 200) { lastReason = 'HTTP ' + r.status; continue; }
+        let j;
+        try { j = JSON.parse(raw); }
+        catch (e) { lastReason = '响应非 JSON：' + raw.slice(0, 60).replace(/\s+/g, ' '); continue; }
         if (j.code === 1 && j.data) return { answer: String(j.data), src: '网课小助手' };
         if (j.code === -2) {
           bankCooldownUntil = Date.now() + CONFIG.BANK_RATE_BACKOFF;
-          log(`题库触发流控，冷却 ${Math.round(CONFIG.BANK_RATE_BACKOFF / 1000)}s 后再试`, 'warn');
-          return null;
+          return { reason: '流控(code:-2)' };
         }
-        if (j.code === -1) return null;      // 未收录
-      } catch (e) {}
+        if (j.code === -1) return { reason: '未收录(code:-1)' };
+        lastReason = '未知响应：' + raw.slice(0, 60);
+      } catch (e) {
+        lastReason = (e && e.message) || '网络错误';
+      }
     }
-    return null;
+    return { reason: lastReason };
   }
 
   // ---------- 统一检索入口 ----------
@@ -1051,6 +1080,7 @@
 
     // ③ 免费公开题库（严格串行 + 限速）
     let n = 0;
+    let errStreak = 0;
     const cap = Math.min(still.length, CONFIG.BANK_MAX_PER_ROUND);
     for (const q of still) {
       if (!running) break;
@@ -1058,15 +1088,29 @@
         log(`本轮免费题库查询已达上限 ${cap} 题，其余直接交给 AI`, 'warn');
         break;
       }
-      if (Date.now() < bankCooldownUntil) { log('题库冷却中，其余题目直接交给 AI', 'warn'); break; }
+      if (Date.now() < bankCooldownUntil) { log('题库流控冷却中，其余题目直接交给 AI', 'warn'); break; }
       n++;
       setStatus(`题库检索 ${n}/${cap}…`);
-      const r = await queryFreeBank(q.title);
+      if (n === 1) log('  题库查询文本示例：' + bankQueryText(q).slice(0, 60));
+      const r = await queryFreeBank(bankQueryText(q));
       if (r && r.answer) {
-        found.set(q.index, r);
+        errStreak = 0;
+        found.set(q.index, { answer: r.answer, src: r.src });
         log(`第 ${q.index} 题 题库命中（${r.src}）：${r.answer.slice(0, 45)}`, 'ok');
+        continue;
+      }
+      const reason = (r && r.reason) || '未知原因';
+      if (/网络|超时|HTTP|非 JSON|未知响应|未发起/.test(reason)) {
+        errStreak++;
+        log(`第 ${q.index} 题 题库请求失败：${reason}`, 'err');
+        if (errStreak >= 2) {
+          log('题库连续 2 次请求失败（网络不通 / 接口挂了 / 跨域被拦），本轮直接改用 AI。可点「🔌 测试题库」看详情', 'err');
+          break;
+        }
+      } else if (/流控/.test(reason)) {
+        log(`第 ${q.index} 题 题库流控，冷却 ${Math.round(CONFIG.BANK_RATE_BACKOFF / 1000)}s…`, 'warn');
       } else {
-        log(`第 ${q.index} 题 题库未收录，交给 AI`);
+        log(`第 ${q.index} 题 题库未收录（${reason}），交给 AI`);
       }
     }
     return found;
@@ -1223,20 +1267,46 @@
         const picked = mapAnswersToOptions(q, ans);
         if (picked.length) {
           const isMulti = q.isMulti || picked.length > 1;
-          for (const opt of picked) await clickOption(opt, isMulti);
+          const targetLetters = picked.map(o => o.letter);
+          let cur = q;
 
-          // 多选题/多选题式点击最容易“点了没生效”，这里统一复检并补点一次
-          let missing = picked.filter(o => !optionSelected(o));
-          if (missing.length) {
-            await sleep(200);
-            for (const opt of missing) await clickOption(opt, isMulti);
-            missing = picked.filter(o => !optionSelected(o));
+          // 每次点击前确认节点还在，失效就重新采集（应对 JS 重渲染）
+          const resolveOpt = L => {
+            let o = (cur.options || []).find(x => x.letter === L) || null;
+            if (!o || !o.el || o.el.isConnected === false) {
+              cur = refreshQuestion(cur);
+              o = (cur.options || []).find(x => x.letter === L) || o;
+            }
+            return o;
+          };
+
+          const clickRes = [];
+          for (const L of targetLetters) {
+            const opt = resolveOpt(L);
+            if (!opt) { log(`第 ${q.index} 题找不到选项 ${L}`, 'warn'); continue; }
+            clickRes.push({ L, ok: await clickOption(opt, isMulti) });
           }
-          log(`${src}第 ${q.index} 题（${q.type || (isMulti ? '多选题' : '单选题')}）已选：${picked.map(o => o.letter).join('、')}`
-            + (missing.length ? `｜警告：${missing.map(o => o.letter).join('、')} 仍未选中` : ''),
+
+          // 复检（用刷新后的题目对象）
+          const findOpt = L => (cur.options || []).find(x => x.letter === L);
+          cur = refreshQuestion(cur);
+          let missing = targetLetters.filter(L => { const o = findOpt(L); return o && !optionSelected(o); });
+          // 只补点「点了完全没反应」的选项；已经有状态变化的一律不再点，避免连点把多选抵消
+          const retryL = clickRes.filter(r => !r.ok).map(r => r.L).filter(L => missing.indexOf(L) > -1);
+          if (retryL.length) {
+            await sleep(350);
+            for (const L of retryL) {
+              const opt = findOpt(L);
+              if (opt) await clickOption(opt, isMulti, { force: true });
+            }
+            cur = refreshQuestion(cur);
+            missing = targetLetters.filter(L => { const o = findOpt(L); return o && !optionSelected(o); });
+          }
+          log(`${src}第 ${q.index} 题（${q.type || (isMulti ? '多选题' : '单选题')}）已选：${targetLetters.join('、')}`
+            + (missing.length ? `｜警告：${missing.join('、')} 仍未选中（可点 🔬 导出题目 HTML 发给助手）` : ''),
             missing.length ? 'warn' : 'ok');
           // 记下多选的期望答案：只要没选全，主循环会继续补选
-          if (isMulti) multiPlan.set(qKeyOf(q), { letters: picked.map(o => o.letter), tries: 0 });
+          if (isMulti) multiPlan.set(qKeyOf(q), { letters: targetLetters, tries: 0 });
           if (isMulti && picked.length < 2) {
             log(`第 ${q.index} 题判定为多选题，但只拿到 1 个答案（${ans.join(',')}），可能漏选，请人工确认`, 'err');
           }
@@ -1283,23 +1353,72 @@
   //      会同时生效，toggle 两次 = 抵消，表现就是"怎么点都选不上"。所以先走
   //      addChoice / 原生 input 这种【只触发一次】的路径，点字母标记时才用不冒泡的 click；
   //   ③ 多选绝不能清除同组其它已选项，否则会把刚选上的答案抹掉。
-  async function clickOption(opt, isMulti) {
+  // 防连点：同一个选项刚点过就不要再点 —— 多选的 checkbox 连点两次 = 刚刚选上的又被取消，
+  // 表现就是"怎么点都选不上"。这是 v3.3.0 之后重点怀疑的元凶之一。
+  const recentClicks = new WeakMap();
+  const CLICK_GUARD_MS = 600;
+
+  // 重新采集一道题：学习通新版是 JS 渲染，点一个选项后整段可能重新渲染，
+  // 之前缓存的 li 节点会失效，后续点击等于点在空气上（多选只剩第一个的元凶）。
+  function refreshQuestion(q) {
+    try {
+      const all = collectQuestions(getAllDocs());
+      const key = qKeyOf(q);
+      return all.find(x => qKeyOf(x) === key) || q;
+    } catch (e) { return q; }
+  }
+
+  async function clickOption(opt, isMulti, opts) {
     const li = opt.li || (opt.el && opt.el.tagName === 'LI' ? opt.el : opt.el);
     if (!li) return false;
     const blockText = ((li.closest && li.closest('.TiMu')) || {}).textContent || '';
     const multi = isMulti === true || MULTI_RE.test(blockText);
     if (optionSelected(opt)) return true;
 
+    // 连点保护
+    const lastClick = recentClicks.get(li);
+    if (!(opts && opts.force) && lastClick && Date.now() - lastClick < CLICK_GUARD_MS) {
+      log(`      选项 ${opt.letter} 刚点过 ${Date.now() - lastClick}ms，跳过以防连点抵消`, 'warn');
+      return optionSelected(opt);
+    }
+
     const win = li.ownerDocument.defaultView;
     const tick = () => sleep(140);
     const before = (li.querySelector && li.querySelector('a.before,span.before,i.before,a[class*="before"],.font-label,span[class*="letter"]')) || null;
 
-    // 单次尝试：只有状态真的变化才算成功
+    // 整题「选中态签名」：判断这一次点击到底有没有产生效果。
+    // 只依赖单个选项的识别器并不可靠（学习通各版本标记方式不同）；一旦漏判，
+    // 上层就会反复点同一个选项 → 多选被来回 toggle → 最后一个都选不上。
+    const sigOf = () => {
+      try {
+        const box = li.closest && li.closest(CONFIG.QUESTION_BLOCK_SEL);
+        if (!box || !box.querySelectorAll) return null;
+        const out = [];
+        Array.from(box.querySelectorAll('li')).forEach((x, i) => {
+          const c = typeof x.className === 'string' ? x.className : '';
+          const aria = x.getAttribute && x.getAttribute('aria-checked');
+          const inp = x.querySelector && x.querySelector('input[type=checkbox],input[type=radio]');
+          if ((inp && inp.checked) || aria === 'true'
+            || /(^|[\s_-])(chosen|active|selected|checked|on)([\s_-]|$)/i.test(c)
+            || /(^|\s)cur(\s|$)/i.test(c)) out.push(i);
+        });
+        return out.join(',');
+      } catch (e) { return null; }
+    };
+
+    // 单次尝试：只要「整题选中态发生了变化」就算这一步生效，不再纠结单个选项认不认得出
     const attempt = async (how, fn) => {
       if (optionSelected(opt)) return true;
+      recentClicks.set(li, Date.now());
+      const s0 = sigOf();
       try { fn(); } catch (e) {}
       await tick();
       if (optionSelected(opt)) { log(`      选项 ${opt.letter} 选中成功（${how}）`); return true; }
+      const s1 = sigOf();
+      if (s0 !== null && s1 !== null && s0 !== s1) {
+        log(`      选项 ${opt.letter} 点击后整题选中态已变化（${s0 || '空'} → ${s1 || '空'}，${how}），判定为已选中`, 'warn');
+        return true;
+      }
       return false;
     };
 
@@ -2085,7 +2204,7 @@
       try { q.box.scrollIntoView({ block: 'center' }); } catch (e) {}
       await sleep(200);
       const targets = q.options.filter(o => plan.letters.indexOf(o.letter) > -1 && missing.indexOf(o.letter) > -1);
-      for (const opt of targets) await clickOption(opt, true);
+      for (const opt of targets) await clickOption(opt, true, { force: true });
       plan.tries++;
       const still = plan.letters.filter(L => selectedLetters(q).indexOf(L) < 0);
       if (still.length) log(`第 ${q.index} 题补选后仍差 ${still.join('、')}（已试 ${plan.tries} 次）`, 'warn');
@@ -2261,10 +2380,18 @@
     qs.slice(0, 3).forEach(q => {
       P.push(`\n===== 第 ${q.index} 题｜type="${q.type}"｜isMulti=${!!q.isMulti}｜选项数=${q.options.length} =====`);
       P.push('题干：' + (q.title || '').slice(0, 150));
+      const hid = (q.box.querySelector && q.box.querySelector('input[type=hidden][name^="answer"]'));
+      P.push('本题隐藏答案框：' + (hid ? `name=${hid.name} value="${hid.value}"` : '无'));
       q.options.forEach(o => {
+        const li = o.li || o.el;
         const sel = o.checked || optionSelected(o);
-        P.push(`  ${o.letter}｜已选中=${sel}｜input=${o.input ? o.input.type + '(checked=' + o.input.checked + ')' : '无'}`
-          + `｜li.class="${(o.li && typeof o.li.className === 'string') ? o.li.className : ''}"`);
+        const aria = (li && li.getAttribute) ? li.getAttribute('aria-checked') : null;
+        const ariaP = (li && li.getAttribute) ? li.getAttribute('aria-pressed') : null;
+        const cls = (li && typeof li.className === 'string') ? li.className : '';
+        const dot = (li && li.querySelector) ? li.querySelector('a.before,i.before,span.before,.num_option') : null;
+        P.push(`  ${o.letter}｜判定=${sel}｜input=${o.input ? o.input.type + '(checked=' + o.input.checked + ')' : '无'}`
+          + `｜li.class="${cls}"｜aria-checked=${aria}｜aria-pressed=${ariaP}`
+          + (dot ? `｜字母标记 <${dot.tagName} class="${dot.className}">` : ''));
       });
       let html = '';
       try { html = q.box.outerHTML || ''; } catch (e) {}
@@ -2387,7 +2514,8 @@
       collectQuestions, clickOption, optionSelected, MULTI_RE,
       selectedLetters, pendingMulti, retryPendingMulti, multiPlan, qKeyOf,
       normQuestion, bankKey, bankAnswerToArray, mapAnswersToOptions, stripOptionLetter,
-      loadLocalBank, saveLocalBank, localBankSize, rememberQuestion, bankLookup, typeToInt
+      loadLocalBank, saveLocalBank, localBankSize, rememberQuestion, bankLookup, typeToInt,
+      bankQueryText, queryFreeBank, refreshQuestion, recentClicks
     };
   } catch (e) {}
 

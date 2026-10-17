@@ -165,6 +165,15 @@
       ok('选中态只体现在子节点 .before.chosen 上时，也能判定为已选', dbg.optionSelected(q1a) === true);
       dot.className = 'before';
 
+      // ---------- G2. 防连点：600ms 内重复点击不能把已选项取消（多选"选不上"元凶） ----------
+      const gopt = q2.options[2];
+      await dbg.clickOption(gopt, true);
+      const firstSel = dbg.optionSelected(gopt);
+      await dbg.clickOption(gopt, true);
+      ok('防连点：短时间内重复点击不会把已选项取消',
+        firstSel === true && dbg.optionSelected(gopt) === true,
+        'first=' + firstSel + ' second=' + dbg.optionSelected(gopt));
+
       // ---------- H. 题库（v3.3.0）：归一化 / 答案解析 / 文本→选项 / 本地库 ----------
       const q5 = qs.find(q => q.title.indexOf('实践是检验真理') > -1);
       ok('扫到判断题 q5', !!q5, q5 && q5.type);
