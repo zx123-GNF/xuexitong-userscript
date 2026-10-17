@@ -62,6 +62,53 @@
     </ul>
   </div>
 
+  <!-- 题6：完全照抄用户真实学习通页面结构（before-after-checkbox + addMultipleChoice + 隐藏答案框）
+       用来验证：点一次必须只触发一次（否则 checkbox 选上又取消） -->
+  <div class="TiMu newTiMu" id="q6">
+    <div class="Zy_TItle clearfix">
+      <i class="fl">6</i>
+      <div class="clearfix fontLabel" style="line-height:1.5;font-size:14px;">
+        <span class="newZy_TItle">【多选题】</span>下列哪些手段可以让内容变得生动?
+      </div>
+    </div>
+    <div class="clearfix">
+      <ul class="Zy_ulTop w-top fl" style="padding-left:10px;">
+        <li tabindex="0" role="checkbox" class="before-after-checkbox" onclick="addMultipleChoice(this);" qid="6001" qtype="1" aria-checked="false" aria-pressed="false">
+          <label class="fl before"><span class="num_option_dx choice6001" name="answercheck6001" data="A">A</span></label>
+          <a href="javascript:void(0);" class="fl after">故事</a>
+          <div class="clear"></div>
+        </li>
+        <li tabindex="0" role="checkbox" class="before-after-checkbox" onclick="addMultipleChoice(this);" qid="6001" qtype="1" aria-checked="false" aria-pressed="false">
+          <label class="fl before"><span class="num_option_dx choice6001" name="answercheck6001" data="B">B</span></label>
+          <a href="javascript:void(0);" class="fl after">事例</a>
+          <div class="clear"></div>
+        </li>
+        <li tabindex="0" role="checkbox" class="before-after-checkbox" onclick="addMultipleChoice(this);" qid="6001" qtype="1" aria-checked="false" aria-pressed="false">
+          <label class="fl before"><span class="num_option_dx choice6001" name="answercheck6001" data="C">C</span></label>
+          <a href="javascript:void(0);" class="fl after">细节</a>
+          <div class="clear"></div>
+        </li>
+        <li tabindex="0" role="checkbox" class="before-after-checkbox" onclick="addMultipleChoice(this);" qid="6001" qtype="1" aria-checked="false" aria-pressed="false">
+          <label class="fl before"><span class="num_option_dx choice6001" name="answercheck6001" data="D">D</span></label>
+          <a href="javascript:void(0);" class="fl after">数字</a>
+          <div class="clear"></div>
+        </li>
+      </ul>
+      <input type="hidden" name="answer6001" id="answer6001" value="">
+      <input type="hidden" id="answertype6001" name="answertype6001" value="1" qid="6001">
+    </div>
+  </div>
+
+  <!-- 题7：没有 onclick 属性，事件用 addEventListener 绑（只能靠 nativeClick 派发）。
+       断言点击次数必须恰为 1 —— 旧版 nativeClick 会派发两次，checkbox 直接抵消 -->
+  <div class="TiMu" id="q7">
+    <div class="Zy_TItle">7.（多选题）下列属于古希腊人本主义表现的有（ ）</div>
+    <ul class="nr_ul" id="ul7">
+      <li id="q7A" aria-checked="false"><a class="before">A</a><span>重视人的价值</span></li>
+      <li id="q7B" aria-checked="false"><a class="before">B</a><span>肯定现世生活</span></li>
+    </ul>
+  </div>
+
   <div id="RESULT">PENDING</div>
 
   <script src="../学习通-DeepSeek自动答题器.user.js"></script>
@@ -73,6 +120,28 @@
     });
   });
   // 题2：故意不绑定任何点击行为，逼 clickOption 走“手动同步 aria”兜底分支
+  // 题6：模拟学习通真实的多选作答函数（真实页面就是 onclick="addMultipleChoice(this)"）
+  window.addMultipleChoice = function (li) {
+    const on = li.getAttribute('aria-checked') === 'true';
+    li.setAttribute('aria-checked', on ? 'false' : 'true');
+    li.setAttribute('aria-pressed', on ? 'false' : 'true');
+    const qid = li.getAttribute('qid');
+    const span = li.querySelector('.num_option_dx');
+    const L = span ? span.getAttribute('data') : '';
+    const hid = document.getElementById('answer' + qid);
+    if (hid && L) {
+      const set = new Set((hid.value || '').match(/[A-Z]/g) || []);
+      if (on) set.delete(L); else set.add(L);
+      hid.value = Array.from(set).sort().join(',');
+    }
+  };
+  // 题7：只绑 addEventListener，顺便记录被点了几次
+  document.querySelectorAll('#ul7 li').forEach(li => {
+    li.addEventListener('click', () => {
+      li.dataset.clicks = String(parseInt(li.dataset.clicks || '0', 10) + 1);
+      li.setAttribute('aria-checked', li.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
+    });
+  });
   </script>
   <script>
   (async function () {
@@ -99,7 +168,7 @@
 
       // ---------- B. 题型识别：只写「（多选）」也要认出来 ----------
       const qs = dbg.collectQuestions(dbg.getAllDocs());
-      ok('扫到 4 道题', qs.length === 4, 'qs=' + qs.length);
+      ok('扫到 6 道题', qs.length === 6, 'qs=' + qs.length);
       const q1 = qs.find(q => q.title.indexOf('下列说法正确') > -1);
       const q2 = qs.find(q => q.title.indexOf('古希腊人本主义') > -1);
       ok('题1 被识别为多选题（题干写了“多选题”）', !!(q1 && q1.isMulti && /多选/.test(q1.type)), q1 && (q1.type + '/isMulti=' + q1.isMulti));
@@ -144,6 +213,7 @@
       q4.options[2].li.setAttribute('aria-checked', 'false');
       q4.options[2].li.setAttribute('aria-pressed', 'false');
       q4.options[2].li.classList.remove('chosen');
+      document.getElementById('answerQ4').value = 'A';   // 隐藏答案框也要同步，它现在是权威判定依据
       dbg.multiPlan.set(dbg.qKeyOf(q4), { letters: ['A', 'C'], tries: 0 });
       const pend = dbg.pendingMulti(q4);
       ok('题4：能检测出多选没选全（缺 C）', !!(pend && pend.missing.join('') === 'C'), pend && pend.missing.join(','));
@@ -240,6 +310,33 @@
         dbg.isBankGarbage('黑格尔的辩证法#费尔巴哈的唯物论') === false
         && dbg.isBankGarbage('人文主义') === false
         && dbg.isBankGarbage('正确') === false);
+
+      // ---------- K. 真实学习通多选结构：一次 clickOption 只能触发一次点击 ----------
+      const q6 = qs.find(q => q.title.indexOf('手段可以让内容变得生动') > -1);
+      ok('题6 被识别为多选题（role=checkbox + 题干【多选题】）', !!(q6 && q6.isMulti), q6 && ('type=' + q6.type));
+      ok('题6 选项字母从 span.num_option_dx[data] 解析为 A–D',
+        !!(q6 && q6.options.map(o => o.letter).join('') === 'ABCD'), q6 && q6.options.map(o => o.letter).join(''));
+      ok('题6 能从 onclick 属性取到页面作答函数', typeof dbg.getPageFn('addMultipleChoice') === 'function');
+
+      await dbg.clickOption(q6.options[0], true);
+      ok('题6：点一次 A → 页面隐藏答案框写入 "A"（没有被连点抵消）',
+        document.getElementById('answer6001').value === 'A',
+        'hidden=' + JSON.stringify(document.getElementById('answer6001').value));
+      ok('题6：A 判定为已选中', dbg.optionSelected(q6.options[0]) === true);
+
+      await dbg.clickOption(q6.options[2], true);
+      ok('题6：再点 C → 隐藏答案框累加为 "A,C"，A 没被顶掉',
+        document.getElementById('answer6001').value === 'A,C',
+        'hidden=' + JSON.stringify(document.getElementById('answer6001').value));
+      ok('题6：A 与 C 同时选中',
+        dbg.optionSelected(q6.options[0]) === true && dbg.optionSelected(q6.options[2]) === true);
+
+      const q7 = qs.find(q => q.title.indexOf('古希腊人本主义表现') > -1 && q.options.length === 2);
+      ok('题7 扫到（无 onclick 属性、只能靠 nativeClick 派发）', !!q7);
+      await dbg.clickOption(q7.options[0], true);
+      ok('题7：一次 clickOption 只触发 1 次点击（旧版会触发 2 次把 checkbox 抵消）',
+        q7.options[0].li.dataset.clicks === '1', 'clicks=' + q7.options[0].li.dataset.clicks);
+      ok('题7：点击后 A 选中', dbg.optionSelected(q7.options[0]) === true);
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }

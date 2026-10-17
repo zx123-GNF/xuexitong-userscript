@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.5.0
-// @description  学习通(超星)自动答题。v3.5.0 按参考脚本（满分助手 2.1.6）的真实搜题逻辑重做题库接入：主源一之题库 cx.icodef.com（过滤"李恒雅/公众号/未搜索到答案"等广告占位答案）+ 备用免费源 free4，查询间隔按实测降到 2s，并修复「🔌 测试题库」未启动就返回已停止、根本没发请求的 bug。查不到才用 DeepSeek；架构不变。
+// @version      3.6.0
+// @description  学习通(超星)自动答题。v3.6.0 找到并修复贯穿多个版本的真正根因：模拟点击时「合成 click + el.click()」等于连点两次，单选（radio）幂等看不出来，多选（checkbox）则选上又取消 —— 这就是"多选怎么都选不上、单选却正常"。同时：从 li 的 onclick 属性发现页面作答函数（addChoice/addMultipleChoice）直接调用、识别新样式选项字母 span.num_option_dx[data]、用隐藏答案框 input[name=answer<qid>] 作为选中依据。题库与 AI 架构不变。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -502,20 +502,36 @@
     return (s || '').replace(/ /g, ' ').replace(/\s+/g, ' ').trim();
   }
 
-  // 模拟真实点击（兼容学习通 jQuery / Vue 绑定的事件）
+  // 模拟点击。
+  // ⚠️ 关键：这里【只派发一次 click】。
+  // 旧版是「合成 click + el.click()」两次，对单选项（radio）幂等看不出来，
+  // 但对多选 checkbox 等于点两次 → 选上又取消 → 永远选不上。
+  // 这就是"单选题正常、多选题怎么都选不上"的真正根因（v3.6.0 修复）。
   function nativeClick(el) {
     try { el.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (e) {}
     const opts = { bubbles: true, cancelable: true, view: el.ownerDocument.defaultView, button: 0 };
-    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(t => {
+    ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(t => {
       let ev;
       try {
-        ev = t.startsWith('pointer')
-          ? new PointerEvent(t, { ...opts, pointerId: 1 })
+        ev = t.indexOf('pointer') === 0
+          ? new PointerEvent(t, Object.assign({}, opts, { pointerId: 1 }))
           : new MouseEvent(t, opts);
-      } catch (e) { ev = new MouseEvent(t, opts); }
-      el.dispatchEvent(ev);
+      } catch (e) { try { ev = new MouseEvent(t, opts); } catch (e2) { return; } }
+      try { el.dispatchEvent(ev); } catch (e) {}
     });
-    try { el.click(); } catch (e) {}
+    try { el.dispatchEvent(new MouseEvent('click', opts)); } catch (e) {}
+  }
+
+  // 取页面上的全局函数（学习通的作答函数在页面上下文里）
+  function getPageFn(name, win) {
+    try {
+      if (!name) return null;
+      const w = win || window;
+      if (typeof w[name] === 'function') return w[name];
+      if (w.wrappedJSObject && typeof w.wrappedJSObject[name] === 'function') return w.wrappedJSObject[name];
+      if (typeof unsafeWindow !== 'undefined' && unsafeWindow && typeof unsafeWindow[name] === 'function') return unsafeWindow[name];
+    } catch (e) {}
+    return null;
   }
 
   function setNativeValue(el, value) {
@@ -589,7 +605,8 @@
         const blockText = cleanText(box.textContent);
         let type = (blockText.match(TYPE_RE) || [])[0] || '';
         // 多选判定：文本带“多选/多项/不定项”（常写成「（多选）」）或有原生 checkbox
-        const multiHint = MULTI_RE.test(blockText) || inputs.some(x => x.type === 'checkbox');
+        const multiHint = MULTI_RE.test(blockText) || inputs.some(x => x.type === 'checkbox')
+          || !!box.querySelector('li[role="checkbox"],input[type=checkbox]');
         if (!type) {
           if (textareas.length && CONFIG.ENABLE_SUBJECTIVE) type = '简答题';
           else if (fillInputs.length) type = '填空题';
@@ -638,7 +655,7 @@
             optionEls.findIndex(o => o === el || (o.contains(el) && o !== el)) === idx);
           options = optionEls.slice(0, 26).map((el, idx) => {
             // 新版学习通：字母写在 <span class="num_option" data="A"> 上
-            const num = el.querySelector('span.num_option,[data-letter],.num_option');
+            const num = el.querySelector('span.num_option, span.num_option_dx, [data-letter], .num_option, span[data], i[data]');
             const dataLetter = (num?.getAttribute('data') || num?.getAttribute('data-letter') || '').trim().toUpperCase();
             const letter = /^[A-Z]$/.test(dataLetter) ? dataLetter : String.fromCharCode(65 + idx);
             const checked = el.getAttribute('aria-checked') === 'true'
@@ -1398,6 +1415,21 @@
     return true;
   }
 
+  // 学习通把已选答案写在 <input type="hidden" name="answer<qid>"> 里（如 "A" / "A,C"）。
+  // 这是最权威的"到底选上了没有"的依据，非空时优先信它。
+  function hiddenAnswerLetters(box) {
+    try {
+      if (!box || !box.querySelectorAll) return null;
+      const all = Array.from(box.querySelectorAll('input[type=hidden][name^="answer"]'));
+      // 排除 answertype<qid> 这种干扰项，优先取 answer<qid>
+      const hid = all.find(x => /^answer\d+$/i.test(x.name || '')) || all[0];
+      if (!hid) return null;
+      const v = String(hid.value || '').toUpperCase();
+      const set = new Set(v.match(/[A-Z]/g) || []);
+      return set.size ? set : null;
+    } catch (e) { return null; }
+  }
+
   // 综合判定选项是否已选中：原生 checked / aria-* / 选中类名（自身 + 子节点都看）
   // 判定要"宽"：宁可认为已选中也不要漏判，否则会出现"点了但脚本以为没点上"而反复点，
   // 对多选来说反复点 = 来回 toggle = 最后什么也没选上。
@@ -1405,6 +1437,12 @@
     const li = opt.li || opt.el;
     if (!li) return false;
     if (opt.input && opt.input.checked) return true;
+    // 权威信号：本题隐藏答案框里已经包含这个字母
+    try {
+      const box = li.closest && li.closest(CONFIG.QUESTION_BLOCK_SEL);
+      const set = box ? hiddenAnswerLetters(box) : null;
+      if (set && set.has(opt.letter)) return true;
+    } catch (e) {}
     const nodes = [li, opt.label, opt.num];
     try {
       if (li.querySelectorAll) {
@@ -1497,14 +1535,28 @@
       return false;
     };
 
-    // ① 页面自带的 addChoice(li)——和真人点击完全等价，只触发一次
-    try {
-      const pageWin = (typeof unsafeWindow !== 'undefined' && win === window.top && unsafeWindow.addChoice) ? unsafeWindow : win;
-      const fn = pageWin.addChoice || (win.wrappedJSObject && win.wrappedJSObject.addChoice);
+    // ① 直接调用页面自己的作答函数（最接近真人点击，且只触发一次）。
+    //    学习通不同版本函数名不同：addChoice / addMultipleChoice / addSingleChoice …
+    //    所以从 li 的 onclick 属性里把函数名抠出来调，不再写死。
+    const handlerName = (() => {
+      try {
+        const a = li.getAttribute && li.getAttribute('onclick');
+        const m = a && String(a).match(/^\s*([A-Za-z_$][\w$]*)\s*\(/);
+        return m ? m[1] : '';
+      } catch (e) { return ''; }
+    })();
+    if (handlerName) {
+      const fn = getPageFn(handlerName, win);
       if (typeof fn === 'function') {
-        if (await attempt('页面 addChoice', () => { try { li.scrollIntoView({ block: 'center' }); } catch (e) {} fn.call(win, li); })) return true;
+        if (await attempt('调用页面 ' + handlerName + '()', () => {
+          try { li.scrollIntoView({ block: 'center' }); } catch (e) {}
+          fn.call(win, li);
+        })) return true;
       }
-    } catch (e) {}
+    }
+    // 注意：这里【不再】盲目调用全局 addChoice/addMultipleChoice。
+    // 同一页面里单选和多选的作答函数名不同，乱调会调错函数；
+    // 没有 onclick 属性的版本交给下面的 nativeClick(li) 触发页面自己绑定的处理器即可。
 
     // ② 原生 input：单击一次，不会被 label + li 双重触发抵消
     if (opt.input) {
@@ -2605,7 +2657,8 @@
       selectedLetters, pendingMulti, retryPendingMulti, multiPlan, qKeyOf,
       normQuestion, bankKey, bankAnswerToArray, mapAnswersToOptions, stripOptionLetter,
       loadLocalBank, saveLocalBank, localBankSize, rememberQuestion, bankLookup, typeToInt,
-      bankQueryText, queryFreeBank, queryFreeBank2, isBankGarbage, BANK_AD_RE, refreshQuestion, recentClicks, questionReport
+      bankQueryText, queryFreeBank, queryFreeBank2, isBankGarbage, BANK_AD_RE, refreshQuestion, recentClicks, questionReport,
+      getPageFn, hiddenAnswerLetters, nativeClick
     };
   } catch (e) {}
 

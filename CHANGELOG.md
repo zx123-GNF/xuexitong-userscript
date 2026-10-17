@@ -4,7 +4,51 @@
 
 ---
 
-## v3.5.0 —（当前最新）
+## v3.6.0 —（当前最新）
+
+**找到并根治了"多选题怎么都选不上"的真正根因。**
+
+### 根因
+
+```js
+// 旧版 nativeClick()
+['pointerdown','mousedown','pointerup','mouseup','click'].forEach(...)  // 合成一次 click
+try { el.click(); } catch (e) {}                                        // 又点一次！
+```
+
+一次 `nativeClick` 会派发**两次 click**。对单选项（radio）来说点两次是幂等的，看不出问题；
+对多选题（checkbox）来说等于**选上又取消**，所以永远选不上 —— 这解释了为什么单选/判断一直正常、
+多选一直失败，也解释了为什么之前的测试能"通过"（测试断言的是脚本自己伪造的 `aria-checked`，
+而页面真正的答案框一直是空的）。
+
+### 修复（基于用户提供的真实学习通 DOM）
+
+真实结构：`<li role="checkbox" class="before-after-checkbox" onclick="addMultipleChoice(this);" aria-checked="false">`
+，答案存在 `<input type="hidden" name="answer<qid>">` 里。
+
+1. **`nativeClick()` 只派发一次 click**（移除 `el.click()` 重复触发）。
+2. **从 `li` 的 `onclick` 属性里自动发现页面作答函数并直接调用一次**
+   （不再写死 `addChoice`；真实页面是 `addMultipleChoice`）。
+   同时**移除**盲目调用全局 `addChoice/addMultipleChoice` 的兜底 —— 同页单选/多选函数名不同，乱调会调错。
+3. **选项字母解析**支持新样式 `span.num_option_dx[data="A"]`（之前只认 `.num_option` / `[data-letter]`，
+   这里一直靠索引兜底，属于隐患）。
+4. **选中判定改用权威信号**：优先读 `input[type=hidden][name="answer<qid>"]` 的值（会自动排除 `answertype<qid>` 干扰项），
+   而不是只看 `aria-*` 和 class —— 后者会被兜底逻辑伪造，导致"判定=true 但实际没选上"。
+5. 多选题识别新增 `li[role="checkbox"]` 信号（真实页面并非总在题干写「多选题」）。
+
+### 测试
+
+新增两道**完全照抄真实 DOM** 的仿真题：
+
+- 题6：`before-after-checkbox` + `addMultipleChoice` + 隐藏答案框
+  断言点一次后隐藏框写入 `"A"`，再点 C 后累加为 `"A,C"`（A 不被顶掉）。
+- 题7：事件只绑 `addEventListener`（无 onclick 属性）
+  断言**一次 clickOption 只触发 1 次页面点击**（旧版会触发 2 次）。
+
+回归测试 74 → **84 项**，全部通过。
+
+---
+## v3.5.0 —（上一版）
 
 参照桌面上的「💯超星学习通满分助手 2.1.6」脚本里的真实搜题逻辑，重做题库接入。**架构不变**（题库 → AI）。
 
