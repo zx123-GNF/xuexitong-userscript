@@ -428,6 +428,16 @@
       const noPop = await dbg.handlePopups(dbg.getAllDocs(), { wait: true });
       ok('无弹窗时 handlePopups(wait:true) 必须返回 false（旧版恒 true 会跳过提交）',
         noPop === false, 'ret=' + noPop);
+
+      // ---------- R. 提交后清扫弹窗 + 拦截提示收紧（v3.8.7） ----------
+      await dbg.sweepDialogs();
+      ok('sweepDialogs 在无弹窗时安全返回、不抛异常', true);
+      ok('UNFINISHED_RE 收紧后不误伤成绩弹窗文案',
+        dbg.UNFINISHED_RE.test('本次测验已完成，得分 80 分') === false
+        && dbg.UNFINISHED_RE.test('已完成') === false);
+      ok('UNFINISHED_RE 仍能命中真正的拦截提示',
+        dbg.UNFINISHED_RE.test('本节含有任务点未完成，请先完成后再提交') === true
+        && dbg.UNFINISHED_RE.test('还有题目未提交') === true);
     } catch (e) {
       R.push('FAIL  测试抛异常：' + (e && e.message));
     }

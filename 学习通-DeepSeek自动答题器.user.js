@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.8.6
-// @description  学习通(超星)自动答题。v3.8.6 修「答完题不提交直接跳过」：handlePopups 在 wait:true 时无弹窗也返回 true，导致 autoSubmit 误以为弹窗已处理、4 轮都不找提交按钮却打印"提交流程已完成"。同时修一批状态机问题：切换任务点后 pageSubmitted 未重置、提交重试无上限、lastNextBlocked 跨轮残留、字体解析失败每轮重跑、加密题重复转写。完整链路：字体hash解密 →（失败）视觉转写文字 → 题库 → 文本AI → 两级提交 → 下一节。
+// @version      3.8.7
+// @description  学习通(超星)自动答题。v3.8.7 修「提交成功后不点下一节」：提交后成绩/解析弹窗会挡住「下一节」的点击，且页面可能重渲染导致旧文档节点失效；现在提交后先清扫弹窗、重新采集文档再找下一节，并把"任务点未完成"提示收紧（避免成绩弹窗被误判成提交失败）。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -2357,7 +2357,9 @@
   }
 
   // 学习通"本节含有任务点未完成"这类拦截提示：出现说明【提交没成功】
-  const UNFINISHED_RE = /任务点未完成|任务点未完成|还有.*未完成|未完成.*任务点|请先完成|未提交|还有题目/;
+  // 注意要收紧：必须同时出现"任务点"和"未完成/未提交"，否则成绩弹窗里随便一句"未完成"
+  // 就会被误判成提交失败，把流程带偏（v3.8.7 收紧）
+  const UNFINISHED_RE = /任务点.{0,8}(未完成|未提交|未做完|没完成)|(未完成|未提交).{0,8}任务点|请先完成.{0,10}任务点|本节.{0,6}(任务点)?未完成|还有题目.{0,4}(未|没)/;
   async function handleUnfinishedBlock() {
     const docs = getAllDocs();
     for (const doc of docs) {
@@ -2645,8 +2647,10 @@
   let lastNextBlocked = false;   // 点「下一节」被"任务点未完成"拦下
   let submitRetryCount = 0;      // 连续"被拦→重提交"的次数，防止死循环
   async function submitOnce(docs, questions) {
-    if (pageSubmitted) { log('本页已提交过，跳过重复提交'); return; }
-    if (await autoSubmit(docs)) pageSubmitted = true;
+    if (pageSubmitted) { log('本页已提交过，跳过重复提交'); return false; }
+    const ok = await autoSubmit(docs);
+    if (ok) pageSubmitted = true;
+    return ok;
   }
 
   /* ------------- 下一节候选解析（v3.0.0 修复核心） -------------
@@ -2899,6 +2903,29 @@
 
   // 逐个尝试候选：点完没跳转就把这个元素拉黑、换下一个，
   // 而不是像旧版那样反复点同一个元素（这是“卡住/提前收工”的根因）。
+  // 提交后页面常留一个"成绩/答案解析"弹窗，它会挡住「下一节」的点击，
+  // 导致所有"下一节"候选都点了没反应、最后被误判成课程结束。
+  // 这里做一次彻底清扫：先走通用弹窗处理，再点掉带 ×/关闭/我知道了 的可见浮层。
+  async function sweepDialogs() {
+    for (let i = 0; i < 3; i++) {
+      if (!running) return;
+      if (await handlePopups(getAllDocs(), { wait: false })) { await sleep(600); continue; }
+      let closed = false;
+      getAllDocs().forEach(doc => {
+        let els = [];
+        try { els = Array.from(doc.querySelectorAll(POPUP_SEL)); } catch (e) { return; }
+        els.filter(isVisible).forEach(pop => {
+          let btns = [];
+          try { btns = Array.from(pop.querySelectorAll('a,span,button,i,.close,[class*="close"]')).filter(isVisible); } catch (e) { return; }
+          const x = btns.find(b => /^(×|✕|x|关闭|我知道了|知道了|完成|确定|OK)$/i.test(cleanText(b.textContent || b.value || '')));
+          if (x) { try { nativeClick(x); closed = true; } catch (e) {} }
+        });
+      });
+      if (!closed) break;
+      await sleep(600);
+    }
+  }
+
   async function clickNextWithRetry(cands, isVideo) {
     lastNextBlocked = false;   // 每次尝试前先清掉上一次的拦截标记，避免串到下一条分支
     for (const c of cands) {
@@ -2982,7 +3009,7 @@
       if (!running) break;
       if (++guard > 3000) { log('安全阀触发：循环次数异常，已停止', 'warn'); break; }
       setStatus(`扫描页面（已推进 ${sections} 步）…`);
-      const docs = getAllDocs();
+      let docs = getAllDocs();
       // 先把字体混淆解开，否则题干是乱码，题库必然查不到、AI 也读不懂
       try { await decodeFontObfuscation(docs); } catch (e) {}
       await scrollAll(docs);
@@ -3013,7 +3040,13 @@
         log(`本节 ${questions.length} 道题均已作答，检查提交…`);
         await submitOnce(docs, questions);
         resetBadNext();
-        await sleep(1500);
+        await sleep(1200);
+        // 提交后：① 成绩/解析弹窗可能还开着，会挡住「下一节」的点击；
+        //         ② 页面可能重渲染/换 iframe，旧文档节点已失效。
+        // 两者都会导致"提交成功后不点下一节"（v3.8.7 修复）。
+        await sweepDialogs();
+        docs = getAllDocs();
+        log(`提交后重新采集文档 ${docs.length} 个、题目 ${collectQuestions(docs).length} 道，继续找下一节`);
       }
 
       // 本页没有未答题目：视频任务点 / 文档 / 过渡页
@@ -3068,6 +3101,7 @@
             break;
           }
           log(`提交未成功导致「下一节」被拦，重新走一遍提交流程…（第 ${submitRetryCount} 次重试）`, 'warn');
+          await sweepDialogs();
           await submitOnce(getAllDocs(), questions);
           await sleep(1200);
           continue;
@@ -3323,7 +3357,8 @@
       getPageFn, hiddenAnswerLetters, nativeClick,
       decodeFontObfuscation, ensureTypr, ensureMd5, ensureFontTable, buildFontMap, submitOnce,
       transcribeEncrypted, glmTranscribeRequest, parseTranscription, glyphInTable, glyphForCode, parseCmapFromBuffer,
-      findClickable, handleUnfinishedBlock, autoSubmit, UNFINISHED_RE, handlePopups, pageSubmitted: () => pageSubmitted
+      findClickable, handleUnfinishedBlock, autoSubmit, UNFINISHED_RE, handlePopups, pageSubmitted: () => pageSubmitted,
+      sweepDialogs
     };
   } catch (e) {}
 
