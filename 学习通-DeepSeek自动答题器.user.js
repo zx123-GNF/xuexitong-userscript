@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         学习通 DeepSeek 自动答题器
 // @namespace    https://api.deepseek.com/
-// @version      3.7.0
-// @description  学习通(超星)自动答题。v3.7.0 新增字体混淆解密：学习通用自定义字体把题干渲染成随机码位（读出来是乱码），现在用页面内嵌字体算字形轮廓 + md5 查映射表还原真字（纯查表、不用 AI），还原后再走「题库 → AI」，题库命中率因此大幅提升。v3.6.0 根治多选选不上（模拟点击重复派发导致 checkbox 抵消）。v3.5.0 按满分助手真实搜题逻辑接入一之题库+备用 free4。
+// @version      3.7.1
+// @description  学习通(超星)自动答题。v3.7.1 修复字体解密"扫描阶段就空手而归"的逻辑漏洞（不再把文档永久标记为已尝试，并全程打印诊断：找到几个混淆元素/字体/映射多少码位/失败原因），同时让本地题库回写可统计（"已收录 N 题"）。v3.7.0 新增字体混淆解密（字形轮廓 md5 查表还原真字，不用 AI）。v3.6.0 根治多选选不上。
 // @author       you
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexi365.cn/*
@@ -1004,22 +1004,23 @@
   function localBankSize() { return Object.keys(loadLocalBank()).length; }
 
   // 收录一道题：存「选项文本」而不是字母，这样即使选项顺序变了也能对上
+  // 返回 true 表示确实写入了（便于上层统计/排查"本地题库一直是 0 题"）
   function rememberQuestion(q, answer) {
     try {
       const ans = String(answer || '').trim();
-      if (!ans || ans.length > 400) return;
+      if (!ans || ans.length > 400) return false;
       const key = bankKey(q);
-      if (!key || key.length < 6) return;
+      if (!key || key.length < 6) return false;
       const bank = loadLocalBank();
-      if (bank[key] && bank[key].a === ans) return;
+      if (bank[key] && bank[key].a === ans) return false;
       bank[key] = { q: (q.title || '').slice(0, 120), a: ans, t: q.type || '', ts: Date.now() };
       const keys = Object.keys(bank);
       if (keys.length > CONFIG.LOCAL_BANK_MAX) {
         keys.sort((a, b) => (bank[a].ts || 0) - (bank[b].ts || 0));
         keys.slice(0, keys.length - CONFIG.LOCAL_BANK_MAX).forEach(k => delete bank[k]);
       }
-      saveLocalBank(bank);
-    } catch (e) {}
+      return !!saveLocalBank(bank);
+    } catch (e) { return false; }
   }
 
   // 题型 → chaoxing-toolkit 协议的数字编号（0单选 1多选 2填空 3判断 4简答 5名词解释 6论述 7计算）
@@ -1244,7 +1245,11 @@
    * 这样后续 collectQuestions 拿到的就是真实文本，题库和 AI 都能正常用。
    */
   let typrPromise = null, md5Promise = null, fontTableData = null, fontTablePromise = null;
-  const fontDecodeTried = new WeakSet();
+  let fontMapCache = null;       // 码位 → 真字
+  let fontMapCacheKey = '';      // 对应哪份字体
+  let fontScanLogged = false;    // 扫描结果只报一次
+  let fontFailLogged = false;    // 失败原因只报一次
+  let fontFailReason = '';
 
   async function ensureMd5() {
     if (typeof md5 === 'function') return md5;
@@ -1310,87 +1315,119 @@
     return fontTablePromise;
   }
 
-  // 对当前所有 frame 做一次字体解密；返回成功解密的元素数
-  async function decodeFontObfuscation(docs) {
-    if (!CONFIG.FONT_DECODE_ENABLED) return 0;
-    // 只有真的存在混淆元素才去加载依赖（避免每页都拉 CDN）
-    const pending = [];
-    docs.forEach(doc => {
-      try {
-        if (fontDecodeTried.has(doc)) return;
-        const els = doc.querySelectorAll('.font-cxsecret,[class*="cxsecret"]');
-        if (els.length) pending.push({ doc, els: Array.from(els) });
-        else fontDecodeTried.add(doc);
-      } catch (e) {}
-    });
-    if (!pending.length) return 0;
+  // 建立「混淆码位 → 真实汉字」映射（只做一次）。失败时把原因记到 fontFailReason。
+  async function buildFontMap(docs) {
+    if (fontMapCache) return fontMapCache;
+    // 1) 任意一个 frame 的 <style> 里找内嵌字体（字体样式和内容不一定在同一个文档）
+    let css = '';
+    for (const doc of docs) {
+      let styles = [];
+      try { styles = Array.from(doc.querySelectorAll('style')); } catch (e) { continue; }
+      for (const st of styles) {
+        const t = st.textContent || '';
+        if (t.indexOf('font-cxsecret') !== -1 && t.indexOf('base64,') !== -1) { css = t; break; }
+      }
+      if (css) break;
+    }
+    if (!css) { fontFailReason = '没在任何 <style> 里找到内嵌的混淆字体(base64)'; return null; }
+
+    let m = css.match(/base64,([\w\W]+?)['"]/);
+    if (!m) m = css.match(/base64,([A-Za-z0-9+\/=]+)/);   // 有的写法 url(...) 里不加引号
+    if (!m) {
+      const u = css.match(/url\((['"]?)([^'")]+\.(?:ttf|otf|woff2?))\1\)/i);
+      fontFailReason = u && !/^data:/i.test(u[2])
+        ? ('字体是外链而不是内嵌 base64：' + u[2].slice(0, 60))
+        : '字体样式里没匹配到 base64 数据';
+      return null;
+    }
+    const b64 = m[1].replace(/\s+/g, '');
+    // 字体变了就重建映射（不同章节可能换字体）
+    const fontKey = b64.length + ':' + b64.slice(0, 32);
+    if (fontMapCache && fontMapCacheKey === fontKey) return fontMapCache;
+    log(`字体解密：找到内嵌字体（base64 ${Math.round(b64.length / 1024)}KB），开始还原…`);
 
     const typr = await ensureTypr();
+    if (!typr) { fontFailReason = 'Typr 字体解析库加载失败（CDN 不通？）'; return null; }
     const md5fn = await ensureMd5();
-    if (!typr || !md5fn) {
-      log('字体解密依赖加载失败（Typr/md5），本页改走截图识别', 'warn');
-      pending.forEach(p => fontDecodeTried.add(p.doc));
-      return 0;
-    }
+    if (!md5fn) { fontFailReason = 'md5 库加载失败（CDN 不通？）'; return null; }
     const table = await ensureFontTable();
-    if (!table) {
-      log('字体映射表不可用，本页改走截图识别', 'warn');
-      pending.forEach(p => fontDecodeTried.add(p.doc));
+    if (!table) { fontFailReason = '字体映射表 table.json 不可用'; return null; }
+
+    let font;
+    try {
+      const bin = atob(b64);
+      const arr = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+      font = typr.parse(arr.buffer || arr);
+    } catch (e) {
+      fontFailReason = '字体解析失败：' + (e && e.message);
+      return null;
+    }
+
+    const map = {};
+    for (let cp = 19968; cp < 40870; cp++) {
+      let g = 0;
+      try { g = typr.U.codeToGlyph(font, cp); } catch (e) { g = 0; }
+      if (!g) continue;
+      try {
+        const path = typr.U.glyphToPath(font, g);
+        const h = md5fn(JSON.stringify(path)).slice(24);
+        const real = table[h];
+        if (typeof real === 'number' && real > 0) map[cp] = real;
+      } catch (e) {}
+    }
+    const n = Object.keys(map).length;
+    if (!n) { fontFailReason = '映射表里对不上这个字体（字体可能换新版了）'; return null; }
+    fontMapCache = map;
+    fontMapCacheKey = fontKey;
+    log(`字体解密：建立映射 ${n} 个码位`, 'ok');
+    return map;
+  }
+
+  // 对当前所有 frame 做一次字体解密；返回替换次数
+  async function decodeFontObfuscation(docs) {
+    if (!CONFIG.FONT_DECODE_ENABLED) return 0;
+
+    // 收集所有混淆元素（每次都重新扫：页面可能后来才渲染出来）
+    const targets = [];
+    docs.forEach(doc => {
+      try {
+        const els = doc.querySelectorAll('.font-cxsecret,[class*="cxsecret"]');
+        if (els.length) Array.prototype.push.apply(targets, Array.from(els));
+      } catch (e) {}
+    });
+    if (!targets.length) {
+      if (!fontScanLogged) {
+        fontScanLogged = true;
+        log(`字体解密：当前页未发现混淆元素（扫描 ${docs.length} 个文档）`);
+      }
       return 0;
     }
 
-    let total = 0;
-    for (const p of pending) {
-      try {
-        // 1) 从 <style> 里抠出内嵌字体的 base64
-        let css = '';
-        const styles = p.doc.querySelectorAll('style');
-        for (const st of styles) {
-          const t = st.textContent || '';
-          if (t.indexOf('font-cxsecret') !== -1) { css = t; break; }
-        }
-        const m = css && css.match(/base64,([\w\W]+?)['"]/);
-        if (!m) { fontDecodeTried.add(p.doc); continue; }
-        const b64 = m[1].replace(/\s+/g, '');
-        const bin = atob(b64);
-        const arr = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-        const font = typr.parse(arr.buffer || arr);
-
-        // 2) 建立「混淆码位 → 真实汉字」映射（CJK 统一表意文字区）
-        const map = {};
-        for (let cp = 19968; cp < 40870; cp++) {
-          let g = 0;
-          try { g = typr.U.codeToGlyph(font, cp); } catch (e) { g = 0; }
-          if (!g) continue;
-          try {
-            const path = typr.U.glyphToPath(font, g);
-            const h = md5fn(JSON.stringify(path)).slice(24);
-            const real = table[h];
-            if (typeof real === 'number' && real > 0) map[cp] = real;
-          } catch (e) {}
-        }
-        const keys = Object.keys(map);
-        if (!keys.length) { fontDecodeTried.add(p.doc); continue; }
-
-        // 3) 替换文本并去掉混淆类名，让后续识别拿到真字
-        p.els.forEach(el => {
-          let html = el.innerHTML || '';
-          keys.forEach(k => {
-            const from = String.fromCharCode(Number(k));
-            if (html.indexOf(from) === -1) return;
-            html = html.split(from).join(String.fromCharCode(map[k]));
-            total++;
-          });
-          el.innerHTML = html;
-          try { el.classList.remove('font-cxsecret'); } catch (e) {}
-          try { el.classList.remove('fontLabel'); } catch (e) {}
-        });
-        fontDecodeTried.add(p.doc);
-      } catch (e) {
-        fontDecodeTried.add(p.doc);
-      }
+    const map = await buildFontMap(docs);
+    if (!map) {
+      if (!fontFailLogged) { fontFailLogged = true; log(`字体解密失败：${fontFailReason}，本页改走截图识别`, 'warn'); }
+      return 0;
     }
+
+    const keys = Object.keys(map);
+    let total = 0;
+    targets.forEach(el => {
+      let html = el.innerHTML || '';
+      let cnt = 0;
+      keys.forEach(k => {
+        const from = String.fromCharCode(Number(k));
+        if (html.indexOf(from) === -1) return;
+        html = html.split(from).join(String.fromCharCode(map[k]));
+        cnt++;
+      });
+      if (cnt) {
+        total += cnt;
+        el.innerHTML = html;
+        try { el.classList.remove('font-cxsecret'); } catch (e) {}
+        try { el.classList.remove('fontLabel'); } catch (e) {}
+      }
+    });
     if (total) log(`字体混淆已解密（${total} 处字符替换），题干现在是真实文字`, 'ok');
     return total;
   }
@@ -1505,6 +1542,7 @@
     }
 
     // ========== 第三段：应用答案 ==========
+    let remembered = 0;
     for (const q of questions) {
       if (!running) return false;
       const ans = answers[q.index];
@@ -1520,7 +1558,7 @@
           if (v) { setNativeValue(inp, v); }
         });
         log(`${src}第 ${q.index} 题（填空）已填入：${ans.join(' / ').slice(0, 60)}`, 'ok');
-        if (CONFIG.LOCAL_BANK) rememberQuestion(q, ans.join('|'));
+        if (CONFIG.LOCAL_BANK && rememberQuestion(q, ans.join('|'))) remembered++;
       } else if (/简答|问答|论述|名词解释|计算|分析/.test(q.type)) {
         const ta = q.textareas[0];
         if (ta) { setNativeValue(ta, ans[0].toString()); log(`第 ${q.index} 题（简答）已填写`, 'ok'); }
@@ -1582,7 +1620,7 @@
             log(`第 ${q.index} 题判定为多选题，但只拿到 1 个答案（${ans.join(',')}），可能漏选，请人工确认`, 'err');
           }
           // 回写本地题库：存「选项文本」，选项顺序变了也能对上
-          if (CONFIG.LOCAL_BANK) rememberQuestion(q, picked.map(o => stripOptionLetter(o.text)).join('#'));
+          if (CONFIG.LOCAL_BANK && rememberQuestion(q, picked.map(o => stripOptionLetter(o.text)).join('#'))) remembered++;
         } else {
           log(`第 ${q.index} 题答案无法匹配选项：${ans.join(',')}`, 'warn');
         }
@@ -1590,6 +1628,7 @@
       await sleep(450);
     }
 
+    if (remembered) log(`已收录 ${remembered} 题到本地题库（当前共 ${localBankSize()} 题）`, 'ok');
     if (aiFailed && !Object.keys(answers).length) { await sleep(3000); return false; }
     return true;
   }
@@ -2212,16 +2251,16 @@
   }
 
   async function autoSubmit(docs) {
-    if (!CONFIG.AUTO_SUBMIT) return;
+    if (!CONFIG.AUTO_SUBMIT) return false;
     // 先看是否已有确认弹窗（提交按钮可能已经点过）
     if (await handlePopups(docs, { wait: false })) {
       log('提交流程已完成', 'ok');
-      return;
+      return true;
     }
     // 找提交按钮
     const btn = findClickable(docs, CONFIG.SUBMIT_TEXT,
       '#submitData,.submitBtn,.tj_btn,.Btn_blue_3,[class*="submit"]');
-    if (!btn) return;
+    if (!btn) return false;
     log(`找到「${btn.t}」按钮，准备提交…`, 'warn');
     try { btn.el.scrollIntoView({ block: 'center' }); } catch (e) {}
     await sleep(500);
@@ -2232,6 +2271,15 @@
     // 再补一轮，防止第二级确认/成绩弹窗延迟出现
     await handlePopups(getAllDocs(), { wait: true });
     log('提交流程已完成', 'ok');
+    return true;
+  }
+
+  // 同一套题只提交一次（避免"已答完→再检查提交"把同一份卷子点两遍）
+  let lastSubmitSig = '';
+  async function submitOnce(docs, questions) {
+    const sig = (questions || []).map(qKeyOf).join('|').slice(0, 400);
+    if (sig && sig === lastSubmitSig) { log('本节已提交过，跳过重复提交'); return; }
+    if (await autoSubmit(docs)) lastSubmitSig = sig;
   }
 
   /* ------------- 下一节候选解析（v3.0.0 修复核心） -------------
@@ -2556,7 +2604,7 @@
         const ok = await answerQuestions(unanswered);
         if (!ok && !running) break;
         await sleep(1000);
-        await autoSubmit(getAllDocs());
+        await submitOnce(getAllDocs(), questions);
         resetBadNext();
         await sleep(1500);
         continue;
@@ -2565,7 +2613,7 @@
       if (questions.length) {
         noNextRetries = 0;
         log(`本节 ${questions.length} 道题均已作答，检查提交…`);
-        await autoSubmit(docs);
+        await submitOnce(docs, questions);
         resetBadNext();
         await sleep(1500);
       }
@@ -2604,6 +2652,7 @@
         if (advanced) {
           sections++;
           resetVisitedTabs();          // 换小节了，任务点标签重新计数
+          lastSubmitSig = '';          // 换小节了，允许重新提交
           if (sections > CONFIG.MAX_SECTIONS) { log('达到最大节数限制，停止', 'warn'); break; }
         } else {
           noNextRetries++;
@@ -2840,7 +2889,7 @@
       loadLocalBank, saveLocalBank, localBankSize, rememberQuestion, bankLookup, typeToInt,
       bankQueryText, queryFreeBank, queryFreeBank2, isBankGarbage, BANK_AD_RE, refreshQuestion, recentClicks, questionReport,
       getPageFn, hiddenAnswerLetters, nativeClick,
-      decodeFontObfuscation, ensureTypr, ensureMd5, ensureFontTable
+      decodeFontObfuscation, ensureTypr, ensureMd5, ensureFontTable, buildFontMap, submitOnce
     };
   } catch (e) {}
 
